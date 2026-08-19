@@ -23,6 +23,14 @@ from .interfaces_base import (
 )
 from .registry import ModelRegistry
 
+# Fork-local compatibility registration. Upstream vLLM PR #52816 adds this
+# entry directly to the large static registry; registering it lazily here keeps
+# this backport small while preserving the same public architecture name.
+ModelRegistry.register_model(
+    "DFlash2DraftModel",
+    "vllm.model_executor.models.qwen3_dflash2:DFlash2Qwen3ForCausalLM",
+)
+
 __all__ = [
     "ModelRegistry",
     "VllmModelForPooling",
