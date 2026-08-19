@@ -12,6 +12,7 @@ from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import triton
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.spec_decode.dflash2 import dflash2_greedy_sample
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.spec_decode.utils import copy_and_expand_dflash_inputs_kernel
 
@@ -67,6 +68,45 @@ class DFlashProposer(SpecDecodeBaseProposer):
 
         # For DFlash we use the input embeddings to embed the mask token
         self.parallel_drafting_hidden_state_tensor = None
+
+        dflash_config = getattr(self.draft_model_config.hf_config, "dflash_config", {})
+        dflash_config = dflash_config or {}
+        architectures = getattr(
+            self.draft_model_config.hf_config, "architectures", ()
+        ) or ()
+        self._is_dflash2 = (
+            "DFlash2DraftModel" in architectures
+            or (
+                "selector_rank" in dflash_config
+                and "selector_top_k" in dflash_config
+                and "conv_kernel_size" in dflash_config
+            )
+        )
+        if self._is_dflash2:
+            if self.speculative_config.draft_sample_method != "greedy":
+                raise ValueError(
+                    "This vLLM 0.21-era DFlash2 backport supports "
+                    "draft_sample_method='greedy' only. Probabilistic/Gumbel "
+                    "DFlash2 requires the newer Model Runner V2 proposal-"
+                    "distribution contract."
+                )
+            if self.use_local_argmax_reduction:
+                logger.info_once(
+                    "Ignoring use_local_argmax_reduction for DFlash2: its candidate "
+                    "selector already performs local top-k followed by a small TP gather."
+                )
+                self.use_local_argmax_reduction = False
+
+    @override
+    def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not self._is_dflash2:
+            return super()._greedy_sample(hidden_states)
+        return dflash2_greedy_sample(
+            self.model,
+            self.input_ids,
+            hidden_states,
+            self.num_speculative_tokens,
+        )
 
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:
