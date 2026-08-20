@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from vllm.plugins.gguf_sm75_stage1 import (
+    _gguf_config_source,
     _tuple_and_layout_aware_weight_loader,
     _vocab_params_dtype,
 )
@@ -143,3 +144,30 @@ def test_vocab_params_dtype_prefers_explicit_attribute() -> None:
     )
 
     assert _vocab_params_dtype(module) is torch.bfloat16
+
+
+def test_gguf_config_source_prefers_explicit_hf_config_path() -> None:
+    assert (
+        _gguf_config_source(
+            "unsloth/Qwen3.6-27B-GGUF:Q4_K_M",
+            "Qwen/Qwen3.6-27B",
+            "Qwen/Qwen3.6-27B-custom-config",
+        )
+        == "Qwen/Qwen3.6-27B-custom-config"
+    )
+
+
+def test_gguf_config_source_falls_back_to_non_gguf_tokenizer() -> None:
+    assert (
+        _gguf_config_source(
+            "unsloth/Qwen3.6-27B-GGUF:Q4_K_M",
+            "Qwen/Qwen3.6-27B",
+            None,
+        )
+        == "Qwen/Qwen3.6-27B"
+    )
+
+
+def test_gguf_config_source_does_not_reuse_gguf_tokenizer_ref() -> None:
+    gguf_ref = "unsloth/Qwen3.6-27B-GGUF:Q4_K_M"
+    assert _gguf_config_source(gguf_ref, gguf_ref, None) is None
