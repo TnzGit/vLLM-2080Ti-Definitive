@@ -1,0 +1,48 @@
+name: GGUF stage1 static checks
+
+on:
+  push:
+    branches:
+      - feature/gguf-sm75-v021
+  pull_request:
+    paths:
+      - "vllm/plugins/gguf_sm75*.py"
+      - "tests/2080ti/test_gguf_qwen35*.py"
+      - "pyproject.toml"
+      - ".github/workflows/gguf-stage1-static.yml"
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile GGUF stage1 Python
+        run: |
+          python -m py_compile \
+            vllm/plugins/gguf_sm75.py \
+            vllm/plugins/gguf_sm75_stage1.py \
+            tests/2080ti/test_gguf_qwen35_adapter.py \
+            tests/2080ti/test_gguf_qwen35_v021_compat.py
+
+      - name: Parse project metadata
+        run: |
+          python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          project = tomllib.loads(Path("pyproject.toml").read_text())
+          plugins = project["project"]["entry-points"]["vllm.general_plugins"]
+          assert plugins["gguf_sm75"] == "vllm.plugins.gguf_sm75_stage1:register"
+          PY
+
+      - name: Check branch diff whitespace
+        run: |
+          git fetch origin vllm-2080ti-definitive-0.1.x
+          git diff --check origin/vllm-2080ti-definitive-0.1.x...HEAD
