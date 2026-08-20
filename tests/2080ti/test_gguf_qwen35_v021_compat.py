@@ -66,6 +66,34 @@ def test_tuple_gguf_weight_type_is_repeated_for_each_logical_shard() -> None:
     assert calls == [(0, 12), (1, 12), (2, 12)]
 
 
+def test_standard_qkv_string_shard_id_passes_through_unchanged() -> None:
+    layer = SimpleNamespace(output_sizes=[4, 4, 8])
+    param = SimpleNamespace(
+        is_gguf_weight=True,
+        is_gguf_weight_type=False,
+        output_dim=0,
+    )
+    calls: list[tuple[str | None, torch.Tensor]] = []
+
+    def fallback(_param, loaded_weight, shard_id=None):
+        calls.append((shard_id, loaded_weight.clone()))
+
+    loaded = torch.arange(12).reshape(4, 3)
+    _tuple_and_layout_aware_weight_loader(
+        layer,
+        fallback,
+        None,
+        0,
+        param,
+        loaded,
+        "q",
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] == "q"
+    torch.testing.assert_close(calls[0][1], loaded)
+
+
 def test_tuple_gguf_weight_requires_exact_fused_output_size() -> None:
     layer = SimpleNamespace(output_sizes=[4, 4, 8, 8])
     param = SimpleNamespace(
