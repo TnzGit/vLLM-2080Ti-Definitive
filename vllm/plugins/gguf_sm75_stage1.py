@@ -26,10 +26,10 @@ from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.gguf import (
-    GGUFLinearMethod as InTreeGGUFLinearMethod,
+    GGUFConfig as InTreeGGUFConfig,
 )
 from vllm.model_executor.layers.quantization.gguf import (
-    GGUFConfig as InTreeGGUFConfig,
+    GGUFLinearMethod as InTreeGGUFLinearMethod,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -43,12 +43,14 @@ from . import gguf_sm75 as base
 
 logger = init_logger(__name__)
 
+ShardId = int | str
+
 
 def _call_weight_loader(
     loader,
     param: torch.Tensor,
     loaded_weight: torch.Tensor,
-    shard_id: int | None = None,
+    shard_id: ShardId | None = None,
 ) -> None:
     if shard_id is None:
         loader(param, loaded_weight)
@@ -63,7 +65,7 @@ def _tuple_and_layout_aware_weight_loader(
     logical_input_size: int,
     param: torch.Tensor,
     loaded_weight: torch.Tensor,
-    loaded_shard_id: tuple[int, ...] | int | None = None,
+    loaded_shard_id: tuple[int, ...] | ShardId | None = None,
 ) -> None:
     """Bridge tuple-shard Qwen GDN weights to the vLLM 0.21 GGUF loader."""
     is_gguf_weight = getattr(param, "is_gguf_weight", False)
@@ -121,11 +123,15 @@ def _tuple_and_layout_aware_weight_loader(
         )
         return
 
+    if isinstance(loaded_shard_id, tuple):
+        raise TypeError(
+            f"Unexpected tuple shard id for non-GGUF parameter: {loaded_shard_id}"
+        )
     _call_weight_loader(
         fallback_loader,
         param,
         loaded_weight,
-        loaded_shard_id if isinstance(loaded_shard_id, int) else None,
+        loaded_shard_id,
     )
 
 
