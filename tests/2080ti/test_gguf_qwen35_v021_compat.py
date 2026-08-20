@@ -8,6 +8,7 @@ from torch import nn
 
 from vllm.plugins.gguf_sm75_stage1 import (
     _gguf_config_source,
+    _is_gguf_reference,
     _tuple_and_layout_aware_weight_loader,
     _vocab_params_dtype,
 )
@@ -171,3 +172,14 @@ def test_gguf_config_source_falls_back_to_non_gguf_tokenizer() -> None:
 def test_gguf_config_source_does_not_reuse_gguf_tokenizer_ref() -> None:
     gguf_ref = "unsloth/Qwen3.6-27B-GGUF:Q4_K_M"
     assert _gguf_config_source(gguf_ref, gguf_ref, None) is None
+
+
+def test_gguf_reference_recognizes_repo_quant_and_exact_remote_file() -> None:
+    assert _is_gguf_reference("unsloth/Qwen3.6-27B-GGUF:Q4_K_M")
+    assert _is_gguf_reference(
+        "unsloth/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf"
+    )
+
+
+def test_gguf_reference_rejects_plain_hf_model() -> None:
+    assert not _is_gguf_reference("Qwen/Qwen3.6-27B")
