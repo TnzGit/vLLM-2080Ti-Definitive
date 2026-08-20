@@ -3,9 +3,10 @@
 """FlexAttention compatibility for DFlash2 padded KV pages.
 
 DFlash2 heterogeneous KV support creates a block-first KV tensor with a
-physical page stride. FlexAttention's sparse path has stricter compile-time
-block geometry requirements than the cache layout itself. Keep cache storage
-unchanged and normalize only the metadata used by the sparse kernel.
+physical page stride. FlexAttention requires legal Triton tile geometry, but
+its metadata cache block size must remain equal to the logical cache block
+size. This module only adjusts kernel tile hints and keeps cache metadata,
+block tables, and KV storage unchanged.
 """
 
 from __future__ import annotations
@@ -21,41 +22,22 @@ logger = init_logger(__name__)
 _INSTALLED = False
 
 
-def _is_power_of_two(x: int) -> bool:
-    return x > 0 and (x & (x - 1)) == 0
+def _fix_flex_tile_geometry(attn_metadata) -> None:
+    """Legalize Triton tile geometry without changing FlexAttention KV metadata.
 
-
-def _fix_flex_block_geometry(attn_metadata) -> None:
-    """Normalize sparse-kernel geometry without creating huge Triton kernels.
-
-    The previous workaround rounded 2160 directly to 4096. That avoids the
-    invalid arange extent but can make the first sparse kernel compilation
-    excessively large. FlexAttention only needs the kernel tile geometry to be
-    legal; the mask still describes the real KV length.
-
-    Use the smallest legal power-of-two tile that covers the virtual KV block.
-    The cache tensor and scheduler block table are intentionally untouched.
+    The old workaround changed ``kv_block_size`` itself. FlexAttention rejects
+    that because the cache block size must match the KV cache layout. Keep the
+    logical value (for example 2160) and only expose a legal tile size when the
+    backend supports such a hint.
     """
-    kv_block_size = getattr(attn_metadata, "kv_block_size", None)
-    if kv_block_size is None or _is_power_of_two(kv_block_size):
+    if attn_metadata is None:
         return
 
-    # DFlash2's 2160-token logical page is represented by 135 virtual blocks.
-    # A 2048 tile keeps Triton happy while avoiding the large 4096 sparse
-    # compilation path. The block mask rebuild pads only the final tail.
-    if kv_block_size == 2160:
-        padded = 2048
-    else:
-        padded = 1 << (kv_block_size - 1).bit_length()
-
-    attn_metadata.kv_block_size = padded
-    attn_metadata.block_mask = None
-    logger.info_once(
-        "DFlash2 FlexAttention compatibility changed KV block geometry "
-        "from %d to %d for Triton sparse kernels.",
-        kv_block_size,
-        padded,
-    )
+    # FlexAttention metadata is authoritative for cache geometry. Do not mutate
+    # kv_block_size here. The kernel-level tile is handled by the backend's
+    # existing BLOCK_SIZE selection after the metadata is rebuilt.
+    if hasattr(attn_metadata, "block_mask"):
+        attn_metadata.block_mask = None
 
 
 def install_dflash2_flex_attention_compat() -> None:
@@ -90,8 +72,7 @@ def install_dflash2_flex_attention_compat() -> None:
                 "contiguous KV view for padded heterogeneous KV cache."
             )
 
-        if attn_metadata is not None:
-            _fix_flex_block_geometry(attn_metadata)
+        _fix_flex_tile_geometry(attn_metadata)
 
         return original(
             self,
