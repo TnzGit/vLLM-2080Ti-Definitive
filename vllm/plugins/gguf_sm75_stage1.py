@@ -3,7 +3,7 @@
 """vLLM 0.21 compatibility fixes for the first SM75 Qwen GGUF stage.
 
 This module is the registered plugin entrypoint for the first-stage GGUF
-backport. It layers two vLLM-0.21-specific fixes on top of ``gguf_sm75``:
+backport. It layers vLLM-0.21-specific compatibility on top of ``gguf_sm75``:
 
 * Qwen3.5 GDN ``in_proj_qkv`` is loaded into the fused ``in_proj_qkvz``
   projection with shard id ``(0, 1, 2)``. The old in-tree GGUF loader rejects
@@ -12,15 +12,21 @@ backport. It layers two vLLM-0.21-specific fixes on top of ``gguf_sm75``:
 * vLLM 0.21's vocab modules do not retain ``params_dtype`` as an attribute.
   Infer it from the existing parameter when rebuilding embeddings/LM heads for
   packed GGUF loading.
+* Keep the Hugging Face config source separate from the GGUF weight source.
+  This lets ``--hf-config-path Qwen/Qwen3.6-27B`` drive model/processor config
+  while ``model_weights`` remains ``repo:quant`` or a local GGUF path.
 """
 
 from __future__ import annotations
 
-from functools import partial
+import os
+from functools import partial, wraps
 
 import torch
+from huggingface_hub import hf_hub_download
 from torch import nn
 
+from vllm.engine.arg_utils import EngineArgs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import register_quantization_config
@@ -36,8 +42,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader import register_model_loader
+from vllm.model_executor.model_loader.weight_utils import download_gguf
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.transformers_utils.gguf_utils import is_gguf
 
 from . import gguf_sm75 as base
 
@@ -270,15 +278,88 @@ def _recursive_replace_vocab_modules(
     replace(model, prefix)
 
 
+def _gguf_config_source(
+    model: str,
+    tokenizer: str | None,
+    hf_config_path: str | None,
+) -> str | None:
+    if hf_config_path:
+        return hf_config_path
+    if tokenizer and not is_gguf(tokenizer):
+        return tokenizer
+    return None
+
+
+def _patch_engine_args() -> None:
+    """Route model config to HF while preserving the GGUF ref as weights."""
+    if getattr(EngineArgs, "_sm75_gguf_model_config_patched", False):
+        return
+
+    original_create_model_config = EngineArgs.create_model_config
+
+    @wraps(original_create_model_config)
+    def create_model_config(self, *args, **kwargs):
+        gguf_model = self.model
+        if is_gguf(gguf_model):
+            config_source = _gguf_config_source(
+                gguf_model,
+                self.tokenizer if isinstance(self.tokenizer, str) else None,
+                self.hf_config_path,
+            )
+            if config_source is not None:
+                self.quantization = "gguf"
+                self.load_format = "gguf"
+                self.model_weights = gguf_model
+                if self.served_model_name is None:
+                    self.served_model_name = gguf_model
+                self.model = config_source
+                if self.tokenizer is None:
+                    self.tokenizer = config_source
+        return original_create_model_config(self, *args, **kwargs)
+
+    EngineArgs.create_model_config = create_model_config
+    EngineArgs._sm75_gguf_model_config_patched = True
+
+
+class Stage1GGUFModelLoader(base.SM75GGUFModelLoader):
+    """GGUF loader that reads weights from ModelConfig.model_weights."""
+
+    def _prepare_weights(self, model_config):
+        model_ref = getattr(model_config, "model_weights", None)
+        if not isinstance(model_ref, str) or not is_gguf(model_ref):
+            return super()._prepare_weights(model_config)
+
+        if os.path.isfile(model_ref):
+            return model_ref
+        if "/" in model_ref and model_ref.endswith(".gguf"):
+            repo_id, filename = model_ref.rsplit("/", 1)
+            return hf_hub_download(repo_id=repo_id, filename=filename)
+        if "/" in model_ref and ":" in model_ref:
+            repo_id, quant_type = model_ref.rsplit(":", 1)
+            return download_gguf(
+                repo_id,
+                quant_type,
+                cache_dir=self.load_config.download_dir,
+                revision=model_config.revision,
+                ignore_patterns=self.load_config.ignore_patterns,
+            )
+        raise ValueError(
+            f"Unrecognised GGUF weight reference: {model_ref} "
+            "(expected local file, <repo_id>/<filename>.gguf, "
+            "or <repo_id>:<quant_type>)"
+        )
+
+
 def register() -> None:
     """Register the complete first-stage SM75 GGUF compatibility layer."""
     # The loader in gguf_sm75 resolves these module globals when load_model()
     # executes, so replace them before registering the loader/config classes.
     base.SM75GGUFConfig = Stage1GGUFConfig
     base._recursive_replace_vocab_modules = _recursive_replace_vocab_modules
+    _patch_engine_args()
 
     register_quantization_config("gguf")(Stage1GGUFConfig)
-    register_model_loader("gguf")(base.SM75GGUFModelLoader)
+    register_model_loader("gguf")(Stage1GGUFModelLoader)
     logger.info_once(
         "Registered first-stage SM75 GGUF support for dense Qwen3.5-family models."
     )
