@@ -9,6 +9,9 @@ backport. It layers vLLM-0.21-specific compatibility on top of ``gguf_sm75``:
   projection with shard id ``(0, 1, 2)``. The old in-tree GGUF loader rejects
   tuple shard ids, so split the fused on-disk tensor into its logical output
   shards and load each shard through the existing, TP-aware loader.
+* Detach TP-local staged GGUF shards from the full CPU tensor storage retained
+  by ``Tensor.narrow()`` views. This keeps ``data_container`` host memory local
+  to each TP rank instead of pinning the whole pre-shard tensor in every worker.
 * vLLM 0.21's vocab modules do not retain ``params_dtype`` as an attribute.
   Infer it from the existing parameter when rebuilding embeddings/LM heads for
   packed GGUF loading.
@@ -52,6 +55,12 @@ from . import gguf_sm75 as base
 logger = init_logger(__name__)
 
 ShardId = int | str
+_MIB = 1024**2
+_GIB = 1024**3
+_LOG_HOST_STAGING = os.getenv("VLLM_GGUF_LOG_HOST_STAGING", "0") == "1"
+_HOST_STAGING_AVOIDED_BYTES = 0
+_HOST_STAGING_LOCAL_BYTES = 0
+_HOST_STAGING_NEXT_LOG_BYTES = 512 * _MIB
 
 
 def _is_gguf_reference(value: str | None) -> bool:
@@ -60,6 +69,97 @@ def _is_gguf_reference(value: str | None) -> bool:
     # vLLM 0.21's is_gguf() recognizes local files and repo:quant, while the
     # in-tree loader also accepts exact remote repo/path/file.gguf references.
     return value.endswith(".gguf") or is_gguf(value)
+
+
+def _storage_nbytes(tensor: torch.Tensor) -> int:
+    """Return bytes owned by the tensor's underlying storage."""
+    return int(tensor.untyped_storage().nbytes())
+
+
+def _detach_staged_gguf_views(param: torch.Tensor) -> tuple[int, int]:
+    """Compact CPU GGUF staging views into independent TP-local storages.
+
+    vLLM 0.21 stores fused GGUF shards in ``param.data_container``. The stock
+    TP loaders use ``narrow()`` to select a rank-local slice and append that
+    view. A narrow view still owns a reference to the full pre-shard CPU
+    storage, so one small staged shard can keep a much larger ``torch.tensor``
+    allocation alive until ``process_weights_after_loading()``.
+
+    Group views by backing storage, clone each group member into compact CPU
+    storage, and report the amount of backing storage that no longer needs to
+    remain reachable plus the TP-local bytes deliberately kept for later fused
+    parameter materialization.
+    """
+    if not getattr(param, "is_gguf_weight", False):
+        return 0, 0
+
+    data_container = getattr(param, "data_container", None)
+    if not isinstance(data_container, list) or not data_container:
+        return 0, 0
+
+    # Only compact views whose storage is larger than the tensor itself. Fully
+    # owned compact tensors are already safe and copying them would only raise
+    # peak RSS without releasing anything.
+    groups: dict[tuple[int, int], list[int]] = {}
+    for index, tensor in enumerate(data_container):
+        if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu":
+            continue
+        tensor_bytes = tensor.numel() * tensor.element_size()
+        storage_bytes = _storage_nbytes(tensor)
+        if storage_bytes <= tensor_bytes:
+            continue
+        storage_ptr = int(tensor.untyped_storage().data_ptr())
+        groups.setdefault((storage_ptr, storage_bytes), []).append(index)
+
+    avoided_bytes = 0
+    local_bytes = 0
+    for (_, storage_bytes), indices in groups.items():
+        group_local_bytes = 0
+        replacements: list[tuple[int, torch.Tensor]] = []
+        for index in indices:
+            staged = data_container[index]
+            group_local_bytes += staged.numel() * staged.element_size()
+            replacements.append(
+                (
+                    index,
+                    staged.clone(memory_format=torch.contiguous_format),
+                )
+            )
+
+        # Replace only after all views in the group have been cloned so the
+        # shared backing storage stays valid throughout the copy.
+        for index, detached in replacements:
+            data_container[index] = detached
+
+        avoided_bytes += max(storage_bytes - group_local_bytes, 0)
+        local_bytes += group_local_bytes
+
+    return avoided_bytes, local_bytes
+
+
+def _record_host_staging_detach(avoided_bytes: int, local_bytes: int) -> None:
+    """Optionally emit coarse per-worker evidence for the host-memory fix."""
+    global _HOST_STAGING_AVOIDED_BYTES
+    global _HOST_STAGING_LOCAL_BYTES
+    global _HOST_STAGING_NEXT_LOG_BYTES
+
+    if avoided_bytes <= 0:
+        return
+
+    _HOST_STAGING_AVOIDED_BYTES += avoided_bytes
+    _HOST_STAGING_LOCAL_BYTES += local_bytes
+    if not _LOG_HOST_STAGING:
+        return
+
+    if _HOST_STAGING_AVOIDED_BYTES >= _HOST_STAGING_NEXT_LOG_BYTES:
+        logger.info(
+            "GGUF host staging detached %.2f GiB of over-retained CPU backing "
+            "storage so far; %.2f GiB of TP-local staged shards are retained.",
+            _HOST_STAGING_AVOIDED_BYTES / _GIB,
+            _HOST_STAGING_LOCAL_BYTES / _GIB,
+        )
+        while _HOST_STAGING_NEXT_LOG_BYTES <= _HOST_STAGING_AVOIDED_BYTES:
+            _HOST_STAGING_NEXT_LOG_BYTES += 512 * _MIB
 
 
 def _call_weight_loader(
@@ -72,6 +172,12 @@ def _call_weight_loader(
         loader(param, loaded_weight)
     else:
         loader(param, loaded_weight, shard_id)
+
+    # The in-tree loader may have just appended a TP narrow view to
+    # data_container. Detach it immediately, while the current full tensor is
+    # still the only unavoidable transient host copy.
+    avoided_bytes, local_bytes = _detach_staged_gguf_views(param)
+    _record_host_staging_detach(avoided_bytes, local_bytes)
 
 
 def _tuple_and_layout_aware_weight_loader(
