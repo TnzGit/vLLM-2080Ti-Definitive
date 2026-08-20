@@ -6,13 +6,16 @@ import torch
 
 from vllm.v1.core.dflash_kv_compat import install_dflash2_heterogeneous_kv_compat
 from vllm.v1.core.dflash_kv_worker_compat import install_dflash2_worker_kv_compat
+from vllm.v1.core.dflash2_flex_attention_compat import (
+    install_dflash2_flex_attention_compat,
+)
 
 # The central KV planner runs in EngineCore, while the actual cache reshape and
-# TurboQuant store kernels execute in worker processes. The Executor bootstrap
-# installs the planner side before KV grouping; the DFlash2 model loader installs
-# the worker-side virtual-block stride/store compatibility here.
+# TurboQuant store kernels execute in worker processes. The DFlash2 model loader
+# installs worker-side compatibility hooks for the remaining execution paths.
 install_dflash2_heterogeneous_kv_compat()
 install_dflash2_worker_kv_compat()
+install_dflash2_flex_attention_compat()
 
 from .dflash2_dtype_compat import combine_dflash2_hidden_states  # noqa: E402
 from .qwen3_dflash2 import (  # noqa: E402
