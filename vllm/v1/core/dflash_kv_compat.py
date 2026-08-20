@@ -304,7 +304,7 @@ def install_dflash2_heterogeneous_kv_compat() -> None:
                 "%d bytes while per-layer cache formats and logical block_size "
                 "remain unchanged (original page sizes: %s).",
                 max_page_size,
-                sorted(page_sizes),
+                tuple(sorted(page_sizes)),
             )
             return padded
 
