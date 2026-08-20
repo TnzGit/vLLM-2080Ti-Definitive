@@ -162,22 +162,30 @@ def _record_host_staging_detach(avoided_bytes: int, local_bytes: int) -> None:
             _HOST_STAGING_NEXT_LOG_BYTES += 512 * _MIB
 
 
+def _detach_and_record_staging(param: torch.Tensor) -> None:
+    avoided_bytes, local_bytes = _detach_staged_gguf_views(param)
+    _record_host_staging_detach(avoided_bytes, local_bytes)
+
+
 def _call_weight_loader(
     loader,
     param: torch.Tensor,
     loaded_weight: torch.Tensor,
     shard_id: ShardId | None = None,
+    *,
+    detach_staging: bool = True,
 ) -> None:
     if shard_id is None:
         loader(param, loaded_weight)
     else:
         loader(param, loaded_weight, shard_id)
 
-    # The in-tree loader may have just appended a TP narrow view to
-    # data_container. Detach it immediately, while the current full tensor is
-    # still the only unavoidable transient host copy.
-    avoided_bytes, local_bytes = _detach_staged_gguf_views(param)
-    _record_host_staging_detach(avoided_bytes, local_bytes)
+    # The in-tree loader may have just appended one or more TP narrow views to
+    # data_container. For ordinary loads, detach immediately. Tuple GDN loads
+    # defer this until all logical shards have been appended so a shared backing
+    # storage is accounted for and cloned only as one group.
+    if detach_staging:
+        _detach_and_record_staging(param)
 
 
 def _tuple_and_layout_aware_weight_loader(
@@ -225,6 +233,7 @@ def _tuple_and_layout_aware_weight_loader(
                 param,
                 loaded_shard,
                 shard_id,
+                detach_staging=False,
             )
             offset += shard_size
         if offset != loaded_weight.shape[output_dim]:
@@ -233,6 +242,7 @@ def _tuple_and_layout_aware_weight_loader(
                 f"loaded={loaded_weight.shape[output_dim]} expected={offset} "
                 f"shards={loaded_shard_id}"
             )
+        _detach_and_record_staging(param)
         return
 
     if layout is not None and is_gguf_weight and loaded_shard_id is None:
