@@ -8,6 +8,7 @@ on:
     paths:
       - "vllm/plugins/gguf_sm75*.py"
       - "tests/2080ti/test_gguf_qwen35*.py"
+      - "tests/2080ti/test_gguf_host_staging.py"
       - "pyproject.toml"
       - ".github/workflows/gguf-stage1-static.yml"
 
@@ -29,7 +30,8 @@ jobs:
             vllm/plugins/gguf_sm75.py \
             vllm/plugins/gguf_sm75_stage1.py \
             tests/2080ti/test_gguf_qwen35_adapter.py \
-            tests/2080ti/test_gguf_qwen35_v021_compat.py
+            tests/2080ti/test_gguf_qwen35_v021_compat.py \
+            tests/2080ti/test_gguf_host_staging.py
 
       - name: Parse project metadata
         run: |
