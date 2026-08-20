@@ -54,6 +54,14 @@ logger = init_logger(__name__)
 ShardId = int | str
 
 
+def _is_gguf_reference(value: str | None) -> bool:
+    if not value:
+        return False
+    # vLLM 0.21's is_gguf() recognizes local files and repo:quant, while the
+    # in-tree loader also accepts exact remote repo/path/file.gguf references.
+    return value.endswith(".gguf") or is_gguf(value)
+
+
 def _call_weight_loader(
     loader,
     param: torch.Tensor,
@@ -283,9 +291,10 @@ def _gguf_config_source(
     tokenizer: str | None,
     hf_config_path: str | None,
 ) -> str | None:
+    del model
     if hf_config_path:
         return hf_config_path
-    if tokenizer and not is_gguf(tokenizer):
+    if tokenizer and not _is_gguf_reference(tokenizer):
         return tokenizer
     return None
 
@@ -300,7 +309,7 @@ def _patch_engine_args() -> None:
     @wraps(original_create_model_config)
     def create_model_config(self, *args, **kwargs):
         gguf_model = self.model
-        if is_gguf(gguf_model):
+        if _is_gguf_reference(gguf_model):
             config_source = _gguf_config_source(
                 gguf_model,
                 self.tokenizer if isinstance(self.tokenizer, str) else None,
@@ -326,7 +335,7 @@ class Stage1GGUFModelLoader(base.SM75GGUFModelLoader):
 
     def _prepare_weights(self, model_config):
         model_ref = getattr(model_config, "model_weights", None)
-        if not isinstance(model_ref, str) or not is_gguf(model_ref):
+        if not isinstance(model_ref, str) or not _is_gguf_reference(model_ref):
             return super()._prepare_weights(model_config)
 
         if os.path.isfile(model_ref):
