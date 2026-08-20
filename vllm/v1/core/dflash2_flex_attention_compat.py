@@ -3,10 +3,9 @@
 """FlexAttention compatibility for DFlash2 padded KV pages.
 
 DFlash2 heterogeneous KV support creates a block-first KV tensor with a
-physical page stride (32768-byte virtual block stride). FlexAttention's legacy
-path assumes the cache geometry is directly usable by its sparse block kernel.
-This module keeps the existing FlexAttention implementation unchanged for
-normal caches and normalizes only the metadata/cache view boundary for DFlash2.
+physical page stride. FlexAttention's sparse path has stricter compile-time
+block geometry requirements than the cache layout itself. Keep cache storage
+unchanged and normalize only the metadata used by the sparse kernel.
 """
 
 from __future__ import annotations
@@ -27,32 +26,36 @@ def _is_power_of_two(x: int) -> bool:
 
 
 def _fix_flex_block_geometry(attn_metadata) -> None:
-    """Make sparse FlexAttention block geometry Triton compatible.
+    """Normalize sparse-kernel geometry without creating huge Triton kernels.
 
-    The DFlash2 logical KV page can be split into 135 virtual kernel blocks.
-    The cache tensor itself must keep that layout, but FlexAttention's sparse
-    Triton kernels require compile-time arange extents to be powers of two.
-    Use a power-of-two KV block and let the existing block mask handle the
-    padded tail.
+    The previous workaround rounded 2160 directly to 4096. That avoids the
+    invalid arange extent but can make the first sparse kernel compilation
+    excessively large. FlexAttention only needs the kernel tile geometry to be
+    legal; the mask still describes the real KV length.
+
+    Use the smallest legal power-of-two tile that covers the virtual KV block.
+    The cache tensor and scheduler block table are intentionally untouched.
     """
     kv_block_size = getattr(attn_metadata, "kv_block_size", None)
     if kv_block_size is None or _is_power_of_two(kv_block_size):
         return
 
-    # 2160-token DFlash logical blocks are represented by the padded cache
-    # compatibility layer as 16-token virtual blocks. Round any remaining
-    # non-power-of-two metadata value upward; masking handles invalid tokens.
-    padded = 1 << (kv_block_size - 1).bit_length()
-    if padded != kv_block_size:
-        attn_metadata.kv_block_size = padded
-        # Force FlexAttention to rebuild BlockMask using the legal geometry.
-        attn_metadata.block_mask = None
-        logger.info_once(
-            "DFlash2 FlexAttention compatibility changed KV block geometry "
-            "from %d to %d for Triton power-of-two sparse kernels.",
-            kv_block_size,
-            padded,
-        )
+    # DFlash2's 2160-token logical page is represented by 135 virtual blocks.
+    # A 2048 tile keeps Triton happy while avoiding the large 4096 sparse
+    # compilation path. The block mask rebuild pads only the final tail.
+    if kv_block_size == 2160:
+        padded = 2048
+    else:
+        padded = 1 << (kv_block_size - 1).bit_length()
+
+    attn_metadata.kv_block_size = padded
+    attn_metadata.block_mask = None
+    logger.info_once(
+        "DFlash2 FlexAttention compatibility changed KV block geometry "
+        "from %d to %d for Triton sparse kernels.",
+        kv_block_size,
+        padded,
+    )
 
 
 def install_dflash2_flex_attention_compat() -> None:
