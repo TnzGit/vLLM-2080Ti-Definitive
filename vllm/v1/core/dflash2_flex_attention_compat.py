@@ -103,11 +103,8 @@ def _get_compact_kv_workspace(
         tuple(kv_cache.shape[2:]),
     )
     pool = _COMPACT_WORKSPACE_POOL.get(key)
-    if pool is None or pool["capacity"] < num_active:
-        capacity = min(
-            max_capacity,
-            max(num_active, pool["capacity"] * 2 if pool else num_active),
-        )
+    if pool is None or pool["capacity"] < max_capacity:
+        capacity = max_capacity
         buffer = torch.empty(
             (2, capacity, *kv_cache.shape[2:]),
             dtype=kv_cache.dtype,
@@ -115,13 +112,13 @@ def _get_compact_kv_workspace(
         )
         pool = {"capacity": capacity, "buffer": buffer}
         _COMPACT_WORKSPACE_POOL[key] = pool
-    return pool["buffer"][:, :num_active]
+    return pool["buffer"]
 
 
 def _compact_single_request_kv(
     kv_cache: torch.Tensor, attn_metadata: Any
 ) -> tuple[torch.Tensor, Callable[[], None]] | None:
-    """Pack active blocks and reuse one workspace across attention layers."""
+    """Refresh mapping and pack active blocks for the batch=1 DFlash2 path."""
     if kv_cache.is_contiguous() or getattr(attn_metadata, "num_reqs", 0) != 1:
         return None
     block_mask = getattr(attn_metadata, "block_mask", None)
@@ -135,78 +132,97 @@ def _compact_single_request_kv(
     if num_active <= 0:
         return None
 
+    key_cache, _ = kv_cache.unbind(0)
+    old_block_table = attn_metadata.block_table
+    old_physical_to_logical = attn_metadata.physical_to_logical
+    old_total_cache_tokens = attn_metadata.total_cache_tokens
+    old_num_blocks = attn_metadata.num_blocks
+    old_seq_lengths = block_mask.seq_lengths
+    old_kv_indices = block_mask.kv_indices
+    old_full_kv_indices = block_mask.full_kv_indices
+
     state = getattr(attn_metadata, "_dflash2_compact_state", None)
-    if state is None or state["block_table"] is not attn_metadata.block_table:
-        key_cache, value_cache = kv_cache.unbind(0)
-        block_ids = attn_metadata.block_table[req, :num_active].to(torch.long)
-        if block_ids.numel() != num_active:
-            return None
-
-        old_block_table = attn_metadata.block_table
-        old_physical_to_logical = attn_metadata.physical_to_logical
-        old_total_cache_tokens = attn_metadata.total_cache_tokens
-        old_num_blocks = attn_metadata.num_blocks
-        old_seq_lengths = block_mask.seq_lengths
-        old_kv_indices = block_mask.kv_indices
-        old_full_kv_indices = block_mask.full_kv_indices
-
-        remap = torch.full(
-            (key_cache.shape[0],), -1, dtype=torch.long, device=block_ids.device
-        )
-        remap[block_ids] = torch.arange(num_active, device=block_ids.device)
-
-        compact_block_table = torch.full_like(old_block_table, -1)
-        compact_block_table[req, :num_active] = torch.arange(
-            num_active, device=old_block_table.device, dtype=old_block_table.dtype
-        )
-        compact_physical_to_logical = torch.full_like(old_physical_to_logical, -1)
-        compact_physical_to_logical[req, :num_active] = old_physical_to_logical[
-            req, block_ids
-        ]
-        compact_kv_indices = _remap_block_indices(old_kv_indices, remap)
-        compact_full_kv_indices = _remap_block_indices(old_full_kv_indices, remap)
-        max_capacity = min(
-            (int(attn_metadata.max_possible_sequence_length) + block_size - 1)
-            // block_size,
-            int(kv_cache.shape[1]),
-        )
-        compact_kv = _get_compact_kv_workspace(
-            kv_cache, num_active, max(max_capacity, num_active)
-        )
-        state = {
-            "block_table": old_block_table,
-            "physical_to_logical": old_physical_to_logical,
-            "total_cache_tokens": old_total_cache_tokens,
-            "num_blocks": old_num_blocks,
-            "seq_lengths": old_seq_lengths,
-            "kv_indices": old_kv_indices,
-            "full_kv_indices": old_full_kv_indices,
-            "block_mask": block_mask,
-            "block_ids": block_ids,
-            "compact_kv": compact_kv,
-            "compact_block_table": compact_block_table,
-            "compact_physical_to_logical": compact_physical_to_logical,
-            "compact_kv_indices": compact_kv_indices,
-            "compact_full_kv_indices": compact_full_kv_indices,
-            "compact_seq_lengths": (old_seq_lengths[0], num_active * block_size),
-            "num_active": num_active,
-        }
+    if state is None or state.get("block_mask") is not block_mask:
+        state = {"block_mask": block_mask}
         attn_metadata._dflash2_compact_state = state
-    else:
-        # A metadata object is shared by all attention layers in one forward.
-        # Reuse its remap tensors and only refill the layer-local KV workspace.
-        compact_kv = state["compact_kv"]
-        if tuple(compact_kv.shape[2:]) != tuple(kv_cache.shape[2:]):
-            return None
 
-    torch.index_select(kv_cache, 1, state["block_ids"], out=state["compact_kv"])
-    compact_kv = state["compact_kv"]
-    attn_metadata.block_table = state["compact_block_table"]
-    attn_metadata.physical_to_logical = state["compact_physical_to_logical"]
-    attn_metadata.total_cache_tokens = state["num_active"] * block_size
-    attn_metadata.num_blocks = state["num_active"]
-    block_mask.kv_indices = state["compact_kv_indices"]
-    block_mask.full_kv_indices = state["compact_full_kv_indices"]
+    block_ids = state.get("block_ids")
+    if block_ids is None or block_ids.numel() != num_active:
+        block_ids = torch.empty(
+            (num_active,), dtype=torch.long, device=old_block_table.device
+        )
+        state["block_ids"] = block_ids
+    block_ids.copy_(old_block_table[req, :num_active])
+
+    remap = state.get("remap")
+    if remap is None or remap.numel() != key_cache.shape[0]:
+        remap = torch.empty(
+            (key_cache.shape[0],), dtype=torch.long, device=key_cache.device
+        )
+        state["remap"] = remap
+    remap.fill_(-1)
+    order = state.get("order")
+    if order is None or order.numel() < num_active:
+        order = torch.arange(num_active, dtype=torch.long, device=key_cache.device)
+        state["order"] = order
+    remap[block_ids] = order[:num_active]
+
+    compact_block_table = state.get("compact_block_table")
+    if compact_block_table is None or compact_block_table.shape != old_block_table.shape:
+        compact_block_table = torch.empty_like(old_block_table)
+        state["compact_block_table"] = compact_block_table
+    compact_block_table.fill_(-1)
+    compact_block_table[req, :num_active] = order[:num_active].to(
+        old_block_table.dtype
+    )
+
+    compact_physical_to_logical = state.get("compact_physical_to_logical")
+    if (
+        compact_physical_to_logical is None
+        or compact_physical_to_logical.shape != old_physical_to_logical.shape
+    ):
+        compact_physical_to_logical = torch.empty_like(old_physical_to_logical)
+        state["compact_physical_to_logical"] = compact_physical_to_logical
+    compact_physical_to_logical.fill_(-1)
+    compact_physical_to_logical[req, :num_active] = old_physical_to_logical[
+        req, block_ids
+    ]
+
+    compact_kv_indices = _remap_block_indices(old_kv_indices, remap)
+    compact_full_kv_indices = _remap_block_indices(old_full_kv_indices, remap)
+    state["compact_kv_indices"] = compact_kv_indices
+    state["compact_full_kv_indices"] = compact_full_kv_indices
+
+    max_capacity = min(
+        (int(attn_metadata.max_possible_sequence_length) + block_size - 1)
+        // block_size,
+        int(kv_cache.shape[1]),
+    )
+    compact_kv = _get_compact_kv_workspace(
+        kv_cache, num_active, max(max_capacity, num_active)
+    )
+    # Keep the full-capacity backing storage stable, but expose only the
+    # active logical blocks to FlexAttention. Its BlockMask must see the
+    # request's actual KV length, not the pool capacity.
+    torch.index_select(kv_cache, 1, block_ids, out=compact_kv[:, :num_active])
+    compact_kv = compact_kv[:, :num_active]
+
+    state["block_table"] = old_block_table
+    state["physical_to_logical"] = old_physical_to_logical
+    state["total_cache_tokens"] = old_total_cache_tokens
+    state["num_blocks"] = old_num_blocks
+    state["seq_lengths"] = old_seq_lengths
+    state["kv_indices"] = old_kv_indices
+    state["full_kv_indices"] = old_full_kv_indices
+    state["num_active"] = num_active
+    state["compact_seq_lengths"] = (old_seq_lengths[0], num_active * block_size)
+
+    attn_metadata.block_table = compact_block_table
+    attn_metadata.physical_to_logical = compact_physical_to_logical
+    attn_metadata.total_cache_tokens = num_active * block_size
+    attn_metadata.num_blocks = num_active
+    block_mask.kv_indices = compact_kv_indices
+    block_mask.full_kv_indices = compact_full_kv_indices
     block_mask.seq_lengths = state["compact_seq_lengths"]
 
     def restore() -> None:
@@ -223,7 +239,13 @@ def _compact_single_request_kv(
         "(%d/%d blocks, %.1f MiB logical cache).",
         num_active,
         kv_cache.shape[1],
-        compact_kv.numel() * compact_kv.element_size() / 2**20,
+        num_active
+        * compact_kv.shape[0]
+        * compact_kv.shape[2]
+        * compact_kv.shape[3]
+        * compact_kv.shape[4]
+        * compact_kv.element_size()
+        / 2**20,
     )
     return compact_kv, restore
 
