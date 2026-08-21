@@ -230,8 +230,19 @@ def install_dflash2_flex_attention_compat() -> None:
             restore_metadata: Callable[[], None] | None = None
             if kv_cache is not None and not kv_cache.is_contiguous():
                 # The legacy FlexAttention forward flattens K/V with view().
-                # Prefer an active-block compact view for the batch=1 path;
-                # retain the full-pool fallback for unsupported batch shapes.
+                # Prefer an active-block compact view for the batch=1 path.
+                # Do not silently materialize the entire padded pool for a
+                # multi-request batch: that path can consume hundreds of MiB
+                # and take EngineCore down under real production load.
+                if attn_metadata is not None and getattr(
+                    attn_metadata, "num_reqs", 0
+                ) > 1:
+                    raise RuntimeError(
+                        "DFlash2 padded heterogeneous KV currently supports "
+                        "batch=1 only; set max_num_seqs=1. Multi-request KV "
+                        "compaction is not implemented, so refusing the "
+                        "unsafe full-pool contiguous fallback."
+                    )
                 if attn_metadata is not None and getattr(
                     attn_metadata, "block_mask", None
                 ) is None:
