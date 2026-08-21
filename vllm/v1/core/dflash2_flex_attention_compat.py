@@ -98,8 +98,7 @@ def _compact_single_request_kv(
     if kv_cache.is_contiguous() or getattr(attn_metadata, "num_reqs", 0) != 1:
         return None
     block_mask = getattr(attn_metadata, "block_mask", None)
-    doc_ids = getattr(attn_metadata, "doc_ids", None)
-    if block_mask is None or doc_ids is None:
+    if block_mask is None:
         return None
 
     # The compact path is explicitly batch=1; avoid a GPU->CPU sync here.
@@ -252,15 +251,11 @@ def install_dflash2_flex_attention_compat() -> None:
         ) -> torch.Tensor:
             restore_metadata: Callable[[], None] | None = None
             if kv_cache is not None and not kv_cache.is_contiguous():
-                # Profiling/KV initialization calls this hook without request
-                # metadata; keep the one required contiguous snapshot there.
-                if attn_metadata is None:
-                    kv_cache = kv_cache.contiguous()
-                    logger.info_once(
-                        "DFlash2 FlexAttention compatibility materialized a "
-                        "contiguous KV view for padded heterogeneous KV cache."
-                    )
-                else:
+                # Profiling calls this hook without metadata, and the original
+                # FlexAttention implementation returns before touching KV.
+                # Leave the non-contiguous cache untouched in that path so it
+                # cannot consume a full-pool temporary during initialization.
+                if attn_metadata is not None:
                     # Real requests must use compact active-block KV. Never
                     # silently materialize the full padded pool on a metadata
                     # miss or an unsupported batch shape.
