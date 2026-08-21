@@ -80,6 +80,102 @@ def _select_legal_direct_kernel_options(
     return options
 
 
+def _remap_block_indices(
+    indices: torch.Tensor | None, remap: torch.Tensor
+) -> torch.Tensor | None:
+    if indices is None:
+        return None
+    out = torch.full_like(indices, -1)
+    valid = indices >= 0
+    if valid.any():
+        out[valid] = remap[indices[valid].long()].to(out.dtype)
+    return out
+
+
+def _compact_single_request_kv(
+    kv_cache: torch.Tensor, attn_metadata: Any
+) -> tuple[torch.Tensor, Callable[[], None]] | None:
+    """Pack only the active physical blocks for the batch=1 DFlash2 path.
+
+    The old compatibility path materializes the entire padded KV pool.  For a
+    single request, the block table already identifies the small subset needed
+    by FlexAttention.  We temporarily remap its BlockMask and physical-to-
+    logical mapping to a compact block numbering, then restore metadata after
+    the forward call.
+    """
+    if kv_cache.is_contiguous() or getattr(attn_metadata, "num_reqs", 0) != 1:
+        return None
+    block_mask = getattr(attn_metadata, "block_mask", None)
+    doc_ids = getattr(attn_metadata, "doc_ids", None)
+    if block_mask is None or doc_ids is None:
+        return None
+
+    req = int(doc_ids[0].item())
+    block_size = int(attn_metadata.block_size)
+    num_active = int(attn_metadata.num_blocks_per_seq[req].item())
+    if num_active <= 0:
+        return None
+
+    key_cache, value_cache = kv_cache.unbind(0)
+    block_ids = attn_metadata.block_table[req, :num_active].to(torch.long)
+    if block_ids.numel() != num_active or torch.any(block_ids < 0):
+        return None
+    if int(block_ids.max().item()) >= key_cache.shape[0]:
+        return None
+
+    compact_key = key_cache.index_select(0, block_ids)
+    compact_value = value_cache.index_select(0, block_ids)
+    compact_kv = torch.stack((compact_key, compact_value), dim=0)
+
+    remap = torch.full(
+        (key_cache.shape[0],), -1, dtype=torch.long, device=block_ids.device
+    )
+    remap[block_ids] = torch.arange(num_active, device=block_ids.device)
+
+    old_block_table = attn_metadata.block_table
+    old_physical_to_logical = attn_metadata.physical_to_logical
+    old_total_cache_tokens = attn_metadata.total_cache_tokens
+    old_num_blocks = attn_metadata.num_blocks
+    old_seq_lengths = block_mask.seq_lengths
+    old_kv_indices = block_mask.kv_indices
+    old_full_kv_indices = block_mask.full_kv_indices
+
+    compact_block_table = torch.full_like(old_block_table, -1)
+    compact_block_table[req, :num_active] = torch.arange(
+        num_active, device=old_block_table.device, dtype=old_block_table.dtype
+    )
+    compact_physical_to_logical = torch.full_like(old_physical_to_logical, -1)
+    compact_physical_to_logical[req, :num_active] = old_physical_to_logical[
+        req, block_ids
+    ]
+
+    attn_metadata.block_table = compact_block_table
+    attn_metadata.physical_to_logical = compact_physical_to_logical
+    attn_metadata.total_cache_tokens = num_active * block_size
+    attn_metadata.num_blocks = num_active
+    block_mask.kv_indices = _remap_block_indices(old_kv_indices, remap)
+    block_mask.full_kv_indices = _remap_block_indices(old_full_kv_indices, remap)
+    block_mask.seq_lengths = (old_seq_lengths[0], num_active * block_size)
+
+    def restore() -> None:
+        attn_metadata.block_table = old_block_table
+        attn_metadata.physical_to_logical = old_physical_to_logical
+        attn_metadata.total_cache_tokens = old_total_cache_tokens
+        attn_metadata.num_blocks = old_num_blocks
+        block_mask.kv_indices = old_kv_indices
+        block_mask.full_kv_indices = old_full_kv_indices
+        block_mask.seq_lengths = old_seq_lengths
+
+    logger.info_once(
+        "DFlash2 FlexAttention using active-block compact KV for batch=1 "
+        "(%d/%d blocks, %.1f MiB logical cache).",
+        num_active,
+        key_cache.shape[0],
+        compact_kv.numel() * compact_kv.element_size() / 2**20,
+    )
+    return compact_kv, restore
+
+
 def install_dflash2_flex_attention_compat() -> None:
     global _INSTALLED
     if _INSTALLED:
@@ -131,28 +227,52 @@ def install_dflash2_flex_attention_compat() -> None:
             output_scale: torch.Tensor | None = None,
             output_block_scale: torch.Tensor | None = None,
         ) -> torch.Tensor:
+            restore_metadata: Callable[[], None] | None = None
             if kv_cache is not None and not kv_cache.is_contiguous():
                 # The legacy FlexAttention forward flattens K/V with view().
-                # Materialize only the local view consumed by FlexAttention;
-                # scheduler/block-table/backing KV storage are unchanged.
-                kv_cache = kv_cache.contiguous()
-                logger.info_once(
-                    "DFlash2 FlexAttention compatibility materialized a "
-                    "contiguous KV view for padded heterogeneous KV cache."
+                # Prefer an active-block compact view for the batch=1 path;
+                # retain the full-pool fallback for unsupported batch shapes.
+                if attn_metadata is not None and getattr(
+                    attn_metadata, "block_mask", None
+                ) is None:
+                    # Metadata is normally pre-built by the builder, but the
+                    # first eager request can arrive before that lazy build.
+                    # Build it here so the compact path also covers request 1
+                    # instead of taking a full-pool snapshot once.
+                    if attn_metadata.direct_build:
+                        attn_metadata.block_mask = attn_metadata._build_block_mask_direct()
+                    else:
+                        attn_metadata.block_mask = attn_metadata.build_block_mask()
+                compact = (
+                    _compact_single_request_kv(kv_cache, attn_metadata)
+                    if attn_metadata is not None
+                    else None
                 )
+                if compact is not None:
+                    kv_cache, restore_metadata = compact
+                else:
+                    kv_cache = kv_cache.contiguous()
+                    logger.info_once(
+                        "DFlash2 FlexAttention compatibility materialized a "
+                        "contiguous KV view for padded heterogeneous KV cache."
+                    )
 
-            return original_forward(
-                self,
-                layer,
-                query,
-                key,
-                value,
-                kv_cache,
-                attn_metadata,
-                output,
-                output_scale=output_scale,
-                output_block_scale=output_block_scale,
-            )
+            try:
+                return original_forward(
+                    self,
+                    layer,
+                    query,
+                    key,
+                    value,
+                    kv_cache,
+                    attn_metadata,
+                    output,
+                    output_scale=output_scale,
+                    output_block_scale=output_block_scale,
+                )
+            finally:
+                if restore_metadata is not None:
+                    restore_metadata()
 
         forward_with_dflash2_kv_compat._dflash2_flex_kv_compat = True  # type: ignore[attr-defined]
         FlexAttentionImpl.forward = forward_with_dflash2_kv_compat
