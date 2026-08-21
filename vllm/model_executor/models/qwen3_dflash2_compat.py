@@ -10,11 +10,19 @@ from vllm.v1.core.dflash_private_kv import (
 )
 
 # The central KV planner runs in EngineCore, while model/cache execution lives
-# in worker processes.  Keep the proven managed/padded path as the default.
+# in worker processes. Keep the proven managed/padded path as the default.
 # The opt-in private/windowed path deliberately bypasses those hooks so the
 # target's native KV layout is not perturbed by DFlash at all.
 if dflash_private_kv_enabled():
     install_dflash2_private_kv_worker_compat()
+    # The legacy GPUModelRunner still chooses speculative CommonAttentionMetadata
+    # by matching drafter.kv_cache_gid. Private KV has no managed draft group, so
+    # retain one target group purely as a metadata anchor after detaching draft KV.
+    from vllm.v1.core.dflash_private_kv_anchor import (
+        install_dflash2_private_metadata_anchor,
+    )
+
+    install_dflash2_private_metadata_anchor()
 else:
     from vllm.v1.core.dflash_kv_compat import install_dflash2_heterogeneous_kv_compat
     from vllm.v1.core.dflash_kv_worker_compat import install_dflash2_worker_kv_compat
