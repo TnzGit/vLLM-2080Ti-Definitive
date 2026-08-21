@@ -85,11 +85,10 @@ def _remap_block_indices(
 ) -> torch.Tensor | None:
     if indices is None:
         return None
-    out = torch.full_like(indices, -1)
     valid = indices >= 0
-    if valid.any():
-        out[valid] = remap[indices[valid].long()].to(out.dtype)
-    return out
+    safe_indices = indices.clamp_min(0).long()
+    mapped = remap[safe_indices].to(indices.dtype)
+    return torch.where(valid, mapped, torch.full_like(indices, -1))
 
 
 def _compact_single_request_kv(
@@ -110,17 +109,16 @@ def _compact_single_request_kv(
     if block_mask is None or doc_ids is None:
         return None
 
-    req = int(doc_ids[0].item())
+    # The compact path is explicitly batch=1; avoid a GPU->CPU sync here.
+    req = 0
     block_size = int(attn_metadata.block_size)
-    num_active = int(attn_metadata.num_blocks_per_seq[req].item())
+    num_active = (int(attn_metadata.max_seq_len) + block_size - 1) // block_size
     if num_active <= 0:
         return None
 
     key_cache, value_cache = kv_cache.unbind(0)
     block_ids = attn_metadata.block_table[req, :num_active].to(torch.long)
-    if block_ids.numel() != num_active or torch.any(block_ids < 0):
-        return None
-    if int(block_ids.max().item()) >= key_cache.shape[0]:
+    if block_ids.numel() != num_active:
         return None
 
     compact_key = key_cache.index_select(0, block_ids)
