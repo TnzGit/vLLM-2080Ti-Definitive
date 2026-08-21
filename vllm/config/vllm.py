@@ -599,6 +599,14 @@ class VllmConfig:
         if self._dflash_needs_multi_kv_group():
             return True
 
+        # The DFlash2 SM75 backport is implemented on the V1 proposer stack
+        # (DFlashProposer + heterogeneous/private KV compat + FlexAttention
+        # compat). Dense targets default to V2 on this runtime, which would
+        # silently bypass the backport via DFlashSpeculator, so force V1.
+        # The env override above still wins for explicit experiments.
+        if self._dflash2_needs_v1_model_runner():
+            return False
+
         if self.model_config is not None and self.model_config.is_diffusion:
             return True
 
@@ -633,6 +641,25 @@ class VllmConfig:
         layer_types = getattr(draft_config.hf_config, "layer_types", None) or []
         num_sliding = sum(lt == "sliding_attention" for lt in layer_types)
         return 0 < num_sliding < len(layer_types)
+
+    def _dflash2_needs_v1_model_runner(self) -> bool:
+        """Whether the speculative draft is a DFlash2 drafter of the SM75 backport."""
+        spec = self.speculative_config
+        if spec is None or spec.method != "dflash":
+            return False
+        draft_config = getattr(spec, "draft_model_config", None)
+        if draft_config is None:
+            return False
+        hf_config = draft_config.hf_config
+        architectures = getattr(hf_config, "architectures", ()) or ()
+        if "DFlash2DraftModel" in architectures:
+            return True
+        dflash_config = getattr(hf_config, "dflash_config", None) or {}
+        return (
+            "selector_rank" in dflash_config
+            and "selector_top_k" in dflash_config
+            and "conv_kernel_size" in dflash_config
+        )
 
     def _is_default_v2_model_runner_model(self) -> bool:
         model_config = self.model_config
