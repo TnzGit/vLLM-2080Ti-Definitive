@@ -266,8 +266,10 @@ class DFlash2Qwen3DecoderLayer(nn.Module):
         if _fp32_island_enabled():
             gate_up, _ = self.mlp.gate_up_proj(hidden_states)
             activated = self.mlp.act_fn(gate_up)
-            local = F.linear(
-                activated.float(), self.mlp.down_proj.weight.float(), bias=None
+            local = torch.mm(
+                activated,
+                self.mlp.down_proj.weight.t(),
+                out_dtype=torch.float32,
             )
             hidden_states = tensor_model_parallel_all_reduce(local)
         else:
