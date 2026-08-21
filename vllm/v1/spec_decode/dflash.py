@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import replace
 from typing import Any
 
 import torch
 from typing_extensions import override
 
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import triton
@@ -17,6 +18,34 @@ from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.spec_decode.utils import copy_and_expand_dflash_inputs_kernel
 
 logger = init_logger(__name__)
+
+
+def _resolve_dflash_draft_cudagraph(device: torch.device) -> tuple[bool, str]:
+    """Resolve whether the DFlash draft itself should use CUDA Graph.
+
+    On the validated SM75 path, PIECEWISE graphs for the target provide almost
+    all of the throughput benefit while graphing the draft consumes substantial
+    extra VRAM. Keep the draft eager by default on pre-SM80 CUDA devices, with
+    an environment override for benchmarking or future kernels.
+    """
+    raw = os.environ.get("VLLM_DFLASH_DRAFT_CUDAGRAPH", "auto").strip().lower()
+    if raw in {"1", "on", "true", "yes"}:
+        return True, "forced-on"
+    if raw in {"0", "off", "false", "no"}:
+        return False, "forced-off"
+    if raw not in {"", "auto"}:
+        logger.warning_once(
+            "Unrecognized VLLM_DFLASH_DRAFT_CUDAGRAPH=%r; using auto mode.", raw
+        )
+
+    if device.type == "cuda":
+        try:
+            major, minor = torch.cuda.get_device_capability(device)
+            if major < 8:
+                return False, f"auto-sm{major}{minor}"
+        except (RuntimeError, AssertionError):
+            pass
+    return True, "auto"
 
 
 class DFlashProposer(SpecDecodeBaseProposer):
@@ -35,19 +64,42 @@ class DFlashProposer(SpecDecodeBaseProposer):
             runner=runner,
         )
 
-        # Only next_token_ids and mask tokens are query tokens, all other context is K/V
+        # Only next_token_ids and mask tokens are query tokens, all other context is K/V.
         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
-        # Positions covers both context states + query states
-        self.max_positions = self.max_num_tokens + self.max_query_tokens
+        # CUDA-graph padding can be slightly larger than the logical query count.
+        graph_capacity = int(self.compilation_config.max_cudagraph_capture_size or 0)
+        self._query_buffer_capacity = max(self.max_query_tokens, graph_capacity)
+        # Positions covers both context states + query states.
+        self.max_positions = self.max_num_tokens + self._query_buffer_capacity
 
-        # Separate context buffers to keep query buffer addresses stable for CUDA graphs
+        # The base proposer allocates input_ids/inputs_embeds for max_num_batched_tokens.
+        # DFlash is parallel-drafting and only feeds the small query batch through the
+        # draft model; context hidden states are precomputed directly into KV. Replace
+        # the oversized query-only buffers with graph-safe query-capacity buffers.
+        self.input_ids = torch.zeros(
+            self._query_buffer_capacity,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.inputs_embeds = torch.zeros(
+            (self._query_buffer_capacity, self.inputs_embeds_size),
+            dtype=self.dtype,
+            device=device,
+        )
+        logger.info_once(
+            "DFlash query buffers capped at %d tokens (base max_num_batched_tokens=%d).",
+            self._query_buffer_capacity,
+            self.max_num_tokens,
+        )
+
+        # Separate context buffers to keep query buffer addresses stable for CUDA graphs.
         self._context_slot_mapping_buffer = torch.zeros(
             self.max_num_tokens,
             dtype=torch.int64,
             device=device,
         )
         self._slot_mapping_buffer = torch.zeros(
-            self.max_query_tokens,
+            self._query_buffer_capacity,
             dtype=torch.int64,
             device=device,
         )
@@ -57,8 +109,13 @@ class DFlashProposer(SpecDecodeBaseProposer):
             device=device,
         )
         self.positions = torch.zeros(
-            self.max_query_tokens,
+            self._query_buffer_capacity,
             dtype=torch.int64,
+            device=device,
+        )
+        self._token_indices_to_sample_buffer = torch.empty(
+            self.max_batch_size * self.num_speculative_tokens,
+            dtype=torch.int32,
             device=device,
         )
 
@@ -66,7 +123,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             self.max_positions + 1, device=device, dtype=torch.int32
         )
 
-        # For DFlash we use the input embeddings to embed the mask token
+        # For DFlash we use the input embeddings to embed the mask token.
         self.parallel_drafting_hidden_state_tensor = None
 
         dflash_config = getattr(self.draft_model_config.hf_config, "dflash_config", {})
@@ -121,7 +178,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
 
     @override
     def _warn_if_multimodal(self):
-        # Override to allow multimodal inputs since DFlash supports Qwen3.5 models
+        # Override to allow multimodal inputs since DFlash supports Qwen3.5 models.
         pass
 
     @override
@@ -142,21 +199,18 @@ class DFlashProposer(SpecDecodeBaseProposer):
         num_query_per_req = 1 + self.num_speculative_tokens
         num_query_total = batch_size * num_query_per_req
 
-        # Store for build_model_inputs_first_pass to use
+        # Store for build_model_inputs_first_pass to use.
         self._dflash_num_context = num_context
 
         # We don't need to copy into a buffer here since the context preprocessing
-        # does not run in a CUDA graph
+        # does not run in a CUDA graph.
         self._dflash_hidden_states = target_hidden_states
 
-        token_indices_to_sample = torch.empty(
-            batch_size * self.num_speculative_tokens,
-            dtype=torch.int32,
-            device=self.device,
-        )
+        num_sample_indices = batch_size * self.num_speculative_tokens
+        token_indices_to_sample = self._token_indices_to_sample_buffer[:num_sample_indices]
 
         # Launch fused triton kernel for input_ids, positions, slot_mapping,
-        # and token_indices_to_sample
+        # and token_indices_to_sample.
         max_ctx_per_req = cad.max_query_len
         max_tokens_per_req = max_ctx_per_req + num_query_per_req
         BLOCK_SIZE = min(256, triton.next_power_of_2(max_tokens_per_req))
@@ -224,7 +278,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             max_seq_len=cad.max_seq_len + num_query_per_req,
             block_table_tensor=cad.block_table_tensor,
             slot_mapping=query_slot_mapping,
-            causal=False,  # Non-causal attention is required for DFlash
+            causal=False,  # Non-causal attention is required for DFlash.
         )
 
         return num_query_total, token_indices_to_sample, new_cad
@@ -242,7 +296,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         Key differences to default dummy_run:
         - Only one forward pass due to parallel drafting
         - DFlash uses context states as unpadded metadata, so hidden_states will
-        use the unpadded num_tokens instead of num_input_tokens
+          use the unpadded num_tokens instead of num_input_tokens
         - max_query_tokens is quite small, DFlash only sees spec tokens as queries
         - Multimodal inputs are not currently supported
         """
@@ -254,7 +308,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         )
 
         # Slot mapping sized to num_input_tokens (query only), matching
-        # the K/V tensor size from the model forward.  Context KVs are
+        # the K/V tensor size from the model forward. Context KVs are
         # pre-inserted separately and don't flow through the model.
         if (
             self._draft_attn_layer_names
@@ -272,7 +326,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         # For the dummy run, we use the dummy buffer.
         context_states = self.hidden_states[:num_tokens]
 
-        # Run the KV projection (GEMM + norms + RoPE) for memory profiling,
+        # Run the KV projection (GEMM + norms + RoPE) for memory profiling.
         self.model.precompute_and_store_context_kv(context_states, context_positions)
         with set_forward_context(
             None,
@@ -299,9 +353,9 @@ class DFlashProposer(SpecDecodeBaseProposer):
         # buffers by the kernel — no copy needed.
         num_context = self._dflash_num_context
 
-        # Pre-insert context KVs directly into cache
+        # Pre-insert context KVs directly into cache.
         self.model.precompute_and_store_context_kv(
-            self._dflash_hidden_states,  # Shape is already [num_context, hidden_size]
+            self._dflash_hidden_states,  # Shape is already [num_context, hidden_size].
             self._context_positions_buffer[:num_context],
             self._context_slot_mapping_buffer[:num_context],
         )
@@ -344,16 +398,33 @@ class DFlashProposer(SpecDecodeBaseProposer):
 
     @override
     def initialize_cudagraph_keys(self, cudagraph_mode):
-        super().initialize_cudagraph_keys(cudagraph_mode)
         if self._is_dflash2:
+            if self.speculative_config.enforce_eager:
+                draft_graph_enabled = False
+                graph_reason = "speculative_config.enforce_eager"
+            else:
+                draft_graph_enabled, graph_reason = _resolve_dflash_draft_cudagraph(
+                    self.device
+                )
+
+            if draft_graph_enabled:
+                super().initialize_cudagraph_keys(cudagraph_mode)
+            else:
+                self.cudagraph_dispatcher.initialize_cudagraph_keys(CUDAGraphMode.NONE)
+
             descriptors = self.cudagraph_dispatcher.get_capture_descs()
             logger.info(
-                "DFlash2 proposer CUDA Graph capture descriptors: %s",
+                "DFlash2 draft CUDA Graph enabled=%s reason=%s descriptors=%s",
+                draft_graph_enabled,
+                graph_reason,
                 [
                     (mode.name, [d.num_tokens for d in descs])
                     for mode, descs in descriptors
                 ],
             )
+            return
+
+        super().initialize_cudagraph_keys(cudagraph_mode)
 
     @override
     def _get_eagle3_use_aux_hidden_state_from_config(self):
