@@ -43,8 +43,36 @@ from .utils import maybe_prefix
 logger = init_logger(__name__)
 
 
+@cache
+def _resolve_fp32_island() -> bool:
+    """Resolve the DFlash2 FP32 island once per worker process.
+
+    ``auto`` is the safe default for this backport: SM75 lacks the numerical
+    headroom that the BF16-trained DFlash2 draft expects, while newer GPUs keep
+    the upstream behavior unless explicitly enabled with ``on``/``1``.
+    """
+    raw = os.environ.get("VLLM_DFLASH_FP32_ISLAND", "auto").strip().lower()
+    if raw in {"1", "on", "true", "yes"}:
+        enabled = True
+    elif raw in {"0", "off", "false", "no"}:
+        enabled = False
+    else:
+        enabled = False
+        if current_platform.is_cuda():
+            try:
+                enabled = torch.cuda.get_device_capability()[0] < 8
+            except (RuntimeError, AssertionError):
+                enabled = False
+    return enabled
+
+
+_FP32_ISLAND_VALUE = False
+
+
 def _fp32_island_enabled() -> bool:
-    return os.environ.get("VLLM_DFLASH_FP32_ISLAND") == "1"
+    # Keep the compiled forward path free of environment/device queries and
+    # logging. The DFlash2 model constructor resolves this once per worker.
+    return _FP32_ISLAND_VALUE
 
 
 def _fp32_rms_norm_add(
@@ -424,6 +452,13 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
         speculative_config = vllm_config.speculative_config
         assert speculative_config is not None
         self.config = speculative_config.draft_model_config.hf_config
+        global _FP32_ISLAND_VALUE
+        _FP32_ISLAND_VALUE = _resolve_fp32_island()
+        logger.info_once(
+            "DFlash2 FP32 island resolved to %s (setting=%s).",
+            _FP32_ISLAND_VALUE,
+            os.environ.get("VLLM_DFLASH_FP32_ISLAND", "auto"),
+        )
         if getattr(self.config, "draft_vocab_size", None) is None:
             self.config.draft_vocab_size = getattr(self.config, "vocab_size", None)
 

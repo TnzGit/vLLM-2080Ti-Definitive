@@ -321,6 +321,19 @@ class DFlashProposer(SpecDecodeBaseProposer):
         per_group, per_layer = super().build_per_group_and_layer_attn_metadata(
             cad, draft_index
         )
+        # DFlash2's padded KV compatibility needs one stable compact mapping
+        # per proposal. FlexAttention is invoked once per participating layer;
+        # preparing here avoids refreshing identical block metadata per layer.
+        if self._is_dflash2:
+            from vllm.v1.core.dflash2_flex_attention_compat import (
+                prepare_dflash2_compact_mapping,
+            )
+
+            seen: set[int] = set()
+            for attn_metadata in per_group:
+                if id(attn_metadata) not in seen:
+                    prepare_dflash2_compact_mapping(attn_metadata)
+                    seen.add(id(attn_metadata))
         for layer_name, attn_metadata in per_layer.items():
             assert getattr(attn_metadata, "causal", None) is False, (
                 f"Attention metadata for layer {layer_name} does not have"
@@ -328,6 +341,19 @@ class DFlashProposer(SpecDecodeBaseProposer):
                 " Consider using a different attention backend, such as FlashAttention."
             )
         return per_group, per_layer
+
+    @override
+    def initialize_cudagraph_keys(self, cudagraph_mode):
+        super().initialize_cudagraph_keys(cudagraph_mode)
+        if self._is_dflash2:
+            descriptors = self.cudagraph_dispatcher.get_capture_descs()
+            logger.info(
+                "DFlash2 proposer CUDA Graph capture descriptors: %s",
+                [
+                    (mode.name, [d.num_tokens for d in descs])
+                    for mode, descs in descriptors
+                ],
+            )
 
     @override
     def _get_eagle3_use_aux_hidden_state_from_config(self):
