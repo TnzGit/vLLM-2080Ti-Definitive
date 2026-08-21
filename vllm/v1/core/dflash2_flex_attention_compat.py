@@ -1,0 +1,438 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""FlexAttention compatibility for DFlash2 padded KV pages.
+
+DFlash2 heterogeneous KV support keeps a 2160-token logical cache block while
+FlexAttention's direct sparse BlockMask path normally reuses that logical block
+size as the Triton ``BLOCK_N`` tile. Triton requires ``tl.arange`` extents to be
+powers of two, so ``BLOCK_N=2160`` cannot compile.
+
+This compatibility layer keeps the cache tensor, block table, logical
+``block_size`` and FlexAttention ``kv_block_size`` unchanged. It only routes an
+illegal direct-build kernel tile through FlexAttention's existing non-direct
+kernel-option selector, which chooses a small power-of-two divisor of the
+logical mask block (16 for the observed 2160-token SM75 path).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from functools import wraps
+from typing import Any
+
+import torch
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+_INSTALLED = False
+_COMPACT_WORKSPACE_POOL: dict[tuple[Any, ...], dict[str, Any]] = {}
+
+
+def _is_power_of_two(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
+
+
+def _select_legal_direct_kernel_options(
+    original: Callable[..., dict[str, int | bool]],
+    query: torch.Tensor,
+    block_m: int,
+    block_n: int,
+    use_direct_build: bool,
+) -> dict[str, int | bool]:
+    """Select legal Triton tiles without changing logical BlockMask geometry.
+
+    FlexAttention's direct-build branch returns ``BLOCK_M/N`` exactly as stored
+    in ``BlockMask.BLOCK_SIZE``. That is fine for the usual power-of-two cache
+    blocks but fails for DFlash2's 2160-token logical block. The backend already
+    has a non-direct option-selection path that chooses smaller divisors for the
+    compute kernel. Reuse that selector while leaving the direct BlockMask and
+    all metadata intact.
+    """
+    if not use_direct_build or (
+        _is_power_of_two(block_m) and _is_power_of_two(block_n)
+    ):
+        return original(query, block_m, block_n, use_direct_build)
+
+    options = original(query, block_m, block_n, False)
+    tile_m = int(options.get("BLOCK_M", 0))
+    tile_n = int(options.get("BLOCK_N", 0))
+
+    if not _is_power_of_two(tile_m) or not _is_power_of_two(tile_n):
+        raise RuntimeError(
+            "DFlash2 FlexAttention kernel-option fallback did not produce "
+            f"power-of-two Triton tiles: BLOCK_M={tile_m}, BLOCK_N={tile_n}."
+        )
+    if block_m % tile_m != 0 or block_n % tile_n != 0:
+        raise RuntimeError(
+            "DFlash2 FlexAttention kernel tiles must divide the logical "
+            f"BlockMask geometry: mask=({block_m}, {block_n}), "
+            f"tiles=({tile_m}, {tile_n})."
+        )
+
+    logger.info_once(
+        "DFlash2 FlexAttention compatibility kept logical BlockMask geometry "
+        "(%d, %d) and selected Triton tiles BLOCK_M=%d, BLOCK_N=%d.",
+        block_m,
+        block_n,
+        tile_m,
+        tile_n,
+    )
+    return options
+
+
+def _remap_block_indices(
+    indices: torch.Tensor | None, remap: torch.Tensor
+) -> torch.Tensor | None:
+    if indices is None:
+        return None
+    valid = indices >= 0
+    safe_indices = indices.clamp_min(0).long()
+    mapped = remap[safe_indices].to(indices.dtype)
+    return torch.where(valid, mapped, torch.full_like(indices, -1))
+
+
+def _remap_block_indices_into(
+    indices: torch.Tensor | None,
+    remap: torch.Tensor,
+    output: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Remap BlockMask indices without a Python-visible CUDA reduction.
+
+    ``Tensor.any()`` in a Python branch synchronizes the host with the device.
+    This helper sits on the per-proposal compact-mapping path, so keep the whole
+    operation asynchronous: gather using clamped indices, then mask invalid
+    entries in-place.
+    """
+    if indices is None:
+        return None
+    if output is None or output.shape != indices.shape or output.dtype != indices.dtype:
+        output = torch.empty_like(indices)
+    safe_indices = indices.clamp_min(0).long()
+    output.copy_(remap[safe_indices].to(indices.dtype))
+    output.masked_fill_(indices < 0, -1)
+    return output
+
+
+def _get_compact_kv_workspace(
+    kv_cache: torch.Tensor, num_active: int, max_capacity: int
+) -> torch.Tensor:
+    """Return a process-local compact KV buffer shared across requests/layers."""
+    key = (
+        kv_cache.device.type,
+        kv_cache.device.index,
+        kv_cache.dtype,
+        tuple(kv_cache.shape[2:]),
+    )
+    pool = _COMPACT_WORKSPACE_POOL.get(key)
+    if pool is None or pool["capacity"] < max_capacity:
+        capacity = max_capacity
+        buffer = torch.empty(
+            (2, capacity, *kv_cache.shape[2:]),
+            dtype=kv_cache.dtype,
+            device=kv_cache.device,
+        )
+        pool = {"capacity": capacity, "buffer": buffer}
+        _COMPACT_WORKSPACE_POOL[key] = pool
+    return pool["buffer"]
+
+
+def _get_or_build_block_mask(attn_metadata: Any) -> Any | None:
+    block_mask = getattr(attn_metadata, "block_mask", None)
+    if block_mask is not None:
+        return block_mask
+    if getattr(attn_metadata, "direct_build", False):
+        block_mask = attn_metadata._build_block_mask_direct()
+    else:
+        block_mask = attn_metadata.build_block_mask()
+    attn_metadata.block_mask = block_mask
+    return block_mask
+
+
+def prepare_dflash2_compact_mapping(attn_metadata: Any) -> None:
+    """Prepare one compact mapping for one DFlash proposal.
+
+    The mapping is shared by every FlexAttention layer participating in the
+    proposal. KV contents are still packed per layer, but block IDs, remaps,
+    compact metadata, and restore references are refreshed only here.
+    """
+    if attn_metadata is None or getattr(attn_metadata, "num_reqs", 0) != 1:
+        return
+    block_mask = _get_or_build_block_mask(attn_metadata)
+    if block_mask is None:
+        return
+
+    block_size = int(attn_metadata.block_size)
+    num_active = (int(attn_metadata.max_seq_len) + block_size - 1) // block_size
+    if num_active <= 0:
+        return
+
+    old_block_table = attn_metadata.block_table
+    old_physical_to_logical = attn_metadata.physical_to_logical
+    if old_physical_to_logical is None:
+        return
+
+    state = getattr(attn_metadata, "_dflash2_compact_state", None)
+    if state is None or state.get("block_mask") is not block_mask:
+        previous_state = state or {}
+        state = {"block_mask": block_mask}
+        for name in (
+            "block_ids",
+            "remap",
+            "order",
+            "compact_block_table",
+            "compact_physical_to_logical",
+            "compact_kv_indices",
+            "compact_full_kv_indices",
+        ):
+            if name in previous_state:
+                state[name] = previous_state[name]
+        attn_metadata._dflash2_compact_state = state
+
+    state["block_table"] = old_block_table
+    state["physical_to_logical"] = old_physical_to_logical
+    state["total_cache_tokens"] = attn_metadata.total_cache_tokens
+    state["num_blocks"] = attn_metadata.num_blocks
+    state["seq_lengths"] = block_mask.seq_lengths
+    state["kv_indices"] = block_mask.kv_indices
+    state["full_kv_indices"] = block_mask.full_kv_indices
+    state["num_active"] = num_active
+
+    block_ids = state.get("block_ids")
+    max_active = old_block_table.shape[1]
+    if block_ids is None or block_ids.numel() < max_active:
+        block_ids = torch.empty(
+            (max_active,), dtype=torch.long, device=old_block_table.device
+        )
+        state["block_ids"] = block_ids
+    active_block_ids = block_ids[:num_active]
+    active_block_ids.copy_(old_block_table[0, :num_active])
+
+    remap = state.get("remap")
+    total_blocks = old_physical_to_logical.shape[-1]
+    if remap is None or remap.numel() != total_blocks:
+        remap = torch.empty(
+            (total_blocks,), dtype=torch.long, device=old_block_table.device
+        )
+        state["remap"] = remap
+    remap.fill_(-1)
+
+    order = state.get("order")
+    if order is None or order.numel() < max_active:
+        order = torch.arange(max_active, dtype=torch.long, device=block_ids.device)
+        state["order"] = order
+    remap[active_block_ids] = order[:num_active]
+
+    compact_block_table = state.get("compact_block_table")
+    if (
+        compact_block_table is None
+        or compact_block_table.shape != old_block_table.shape
+    ):
+        compact_block_table = torch.empty_like(old_block_table)
+        state["compact_block_table"] = compact_block_table
+    compact_block_table.fill_(-1)
+    compact_block_table[0, :num_active] = order[:num_active].to(old_block_table.dtype)
+
+    compact_physical_to_logical = state.get("compact_physical_to_logical")
+    if (
+        compact_physical_to_logical is None
+        or compact_physical_to_logical.shape != old_physical_to_logical.shape
+    ):
+        compact_physical_to_logical = torch.empty_like(old_physical_to_logical)
+        state["compact_physical_to_logical"] = compact_physical_to_logical
+    compact_physical_to_logical.fill_(-1)
+    compact_physical_to_logical[0, :num_active] = old_physical_to_logical[
+        0, active_block_ids
+    ]
+
+    state["compact_kv_indices"] = _remap_block_indices_into(
+        block_mask.kv_indices, remap, state.get("compact_kv_indices")
+    )
+    state["compact_full_kv_indices"] = _remap_block_indices_into(
+        block_mask.full_kv_indices, remap, state.get("compact_full_kv_indices")
+    )
+    state["prepare_count"] = int(state.get("prepare_count", 0)) + 1
+    state["compact_seq_lengths"] = (state["seq_lengths"][0], num_active * block_size)
+    state["prepared"] = True
+
+
+def _compact_single_request_kv(
+    kv_cache: torch.Tensor, attn_metadata: Any
+) -> tuple[torch.Tensor, Callable[[], None]] | None:
+    """Pack only layer-local KV using the proposal's prepared mapping."""
+    if kv_cache.is_contiguous() or getattr(attn_metadata, "num_reqs", 0) != 1:
+        return None
+    block_mask = getattr(attn_metadata, "block_mask", None)
+    state = getattr(attn_metadata, "_dflash2_compact_state", None)
+    if block_mask is None or state is None or not state.get("prepared"):
+        return None
+
+    block_size = int(attn_metadata.block_size)
+    num_active = (int(attn_metadata.max_seq_len) + block_size - 1) // block_size
+    if num_active <= 0:
+        return None
+
+    block_ids = state["block_ids"][:num_active]
+    if int(state["num_active"]) != num_active:
+        raise RuntimeError(
+            "DFlash2 compact mapping is stale within a proposal: "
+            f"prepared={state['num_active']} current={num_active}."
+        )
+
+    max_capacity = min(
+        (int(attn_metadata.max_possible_sequence_length) + block_size - 1)
+        // block_size,
+        int(kv_cache.shape[1]),
+    )
+    compact_kv = _get_compact_kv_workspace(
+        kv_cache, num_active, max(max_capacity, num_active)
+    )
+    # Keep the full-capacity backing storage stable, but expose only the
+    # active logical blocks to FlexAttention. Its BlockMask must see the
+    # request's actual KV length, not the pool capacity.
+    torch.index_select(kv_cache, 1, block_ids, out=compact_kv[:, :num_active])
+    compact_kv = compact_kv[:, :num_active]
+
+    attn_metadata.block_table = state["compact_block_table"]
+    attn_metadata.physical_to_logical = state["compact_physical_to_logical"]
+    attn_metadata.total_cache_tokens = num_active * block_size
+    attn_metadata.num_blocks = num_active
+    block_mask.kv_indices = state["compact_kv_indices"]
+    block_mask.full_kv_indices = state["compact_full_kv_indices"]
+    block_mask.seq_lengths = state["compact_seq_lengths"]
+
+    def restore() -> None:
+        attn_metadata.block_table = state["block_table"]
+        attn_metadata.physical_to_logical = state["physical_to_logical"]
+        attn_metadata.total_cache_tokens = state["total_cache_tokens"]
+        attn_metadata.num_blocks = state["num_blocks"]
+        block_mask.kv_indices = state["kv_indices"]
+        block_mask.full_kv_indices = state["full_kv_indices"]
+        block_mask.seq_lengths = state["seq_lengths"]
+
+    logger.info_once(
+        "DFlash2 FlexAttention using active-block compact KV for batch=1 "
+        "(%d/%d blocks, %.1f MiB logical cache).",
+        num_active,
+        kv_cache.shape[1],
+        num_active
+        * compact_kv.shape[0]
+        * compact_kv.shape[2]
+        * compact_kv.shape[3]
+        * compact_kv.shape[4]
+        * compact_kv.element_size()
+        / 2**20,
+    )
+    return compact_kv, restore
+
+
+def install_dflash2_flex_attention_compat() -> None:
+    global _INSTALLED
+    if _INSTALLED:
+        return
+
+    from vllm.v1.attention.backends import flex_attention as flex_mod
+
+    # Patch only kernel-option selection. BlockMask metadata remains authoritative
+    # and keeps kv_block_size == cache block_size == 2160 on the reported path.
+    original_get_kernel_options = flex_mod.get_kernel_options
+    if not getattr(
+        original_get_kernel_options, "_dflash2_power_of_two_tile_compat", False
+    ):
+
+        @wraps(original_get_kernel_options)
+        def get_kernel_options_with_dflash2_tiles(
+            query: torch.Tensor,
+            block_m: int,
+            block_n: int,
+            use_direct_build: bool,
+        ) -> dict[str, int | bool]:
+            return _select_legal_direct_kernel_options(
+                original_get_kernel_options,
+                query,
+                block_m,
+                block_n,
+                use_direct_build,
+            )
+
+        get_kernel_options_with_dflash2_tiles._dflash2_power_of_two_tile_compat = (  # type: ignore[attr-defined]
+            True
+        )
+        flex_mod.get_kernel_options = get_kernel_options_with_dflash2_tiles
+
+    FlexAttentionImpl = flex_mod.FlexAttentionImpl
+    original_forward = FlexAttentionImpl.forward
+    if not getattr(original_forward, "_dflash2_flex_kv_compat", False):
+
+        @wraps(original_forward)
+        def forward_with_dflash2_kv_compat(
+            self: Any,
+            layer: Any,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            kv_cache: torch.Tensor,
+            attn_metadata: Any,
+            output: torch.Tensor,
+            output_scale: torch.Tensor | None = None,
+            output_block_scale: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            restore_metadata: Callable[[], None] | None = None
+            # Profiling calls this hook without metadata or with a contiguous
+            # cache, and the original FlexAttention implementation returns
+            # before touching KV. Leave those paths untouched so they cannot
+            # consume a full-pool temporary during initialization. Real
+            # requests must use compact active-block KV. Never silently
+            # materialize the full padded pool on a metadata miss or an
+            # unsupported batch shape.
+            if (
+                kv_cache is not None
+                and not kv_cache.is_contiguous()
+                and attn_metadata is not None
+            ):
+                if getattr(attn_metadata, "num_reqs", 0) > 1:
+                    raise RuntimeError(
+                        "DFlash2 padded heterogeneous KV currently supports "
+                        "batch=1 only; set max_num_seqs=1. Multi-request KV "
+                        "compaction is not implemented, so refusing the "
+                        "unsafe full-pool contiguous fallback."
+                    )
+                if getattr(attn_metadata, "block_mask", None) is None:
+                    # Metadata is normally pre-built by the builder, but the
+                    # first eager request can arrive before that lazy build.
+                    if attn_metadata.direct_build:
+                        attn_metadata.block_mask = (
+                            attn_metadata._build_block_mask_direct()
+                        )
+                    else:
+                        attn_metadata.block_mask = attn_metadata.build_block_mask()
+                compact = _compact_single_request_kv(kv_cache, attn_metadata)
+                if compact is None:
+                    raise RuntimeError(
+                        "DFlash2 compact KV unavailable; refusing unsafe "
+                        "full-pool snapshot."
+                    )
+                kv_cache, restore_metadata = compact
+
+            try:
+                return original_forward(
+                    self,
+                    layer,
+                    query,
+                    key,
+                    value,
+                    kv_cache,
+                    attn_metadata,
+                    output,
+                    output_scale=output_scale,
+                    output_block_scale=output_block_scale,
+                )
+            finally:
+                if restore_metadata is not None:
+                    restore_metadata()
+
+        forward_with_dflash2_kv_compat._dflash2_flex_kv_compat = True  # type: ignore[attr-defined]
+        FlexAttentionImpl.forward = forward_with_dflash2_kv_compat
+
+    _INSTALLED = True
