@@ -3,14 +3,14 @@
 """Experimental private/windowed KV cache for DFlash2.
 
 The legacy vLLM hybrid KV manager has to co-plan the target model's quantized
-KV/state caches and DFlash's native FP16 attention cache.  On Qwen3.5/3.8 this
+KV/state caches and DFlash's native FP16 attention cache. On Qwen3.5/3.8 this
 causes the five DFlash attention layers to change the target's otherwise compact
 hybrid grouping and, on the compatibility path, to inflate smaller physical
-pages to the largest DFlash page.  That is acceptable as a correctness bridge
+pages to the largest DFlash page. That is acceptable as a correctness bridge
 but destroys long-context capacity.
 
 This module provides an opt-in escape hatch for the validated batch=1 DFlash2
-path.  When ``VLLM_DFLASH_PRIVATE_KV_WINDOW`` is a positive integer:
+path. When ``VLLM_DFLASH_PRIVATE_KV_WINDOW`` is a positive integer:
 
 * EngineCore removes only the DFlash draft attention layers from the centrally
   managed KV specs, leaving the target's native KV planner untouched.
@@ -18,11 +18,11 @@ path.  When ``VLLM_DFLASH_PRIVATE_KV_WINDOW`` is a positive integer:
   model loading, before target KV-memory profiling.
 * Target hidden-state K/V for the most recent window are written to that ring.
 * DFlash query attention is computed directly from the private context K/V plus
-  the current bonus/mask query K/V.  The target verifier still attends the full
+  the current bonus/mask query K/V. The target verifier still attends the full
   target context, so truncating the *draft* context can only affect acceptance,
   not the verifier's correctness contract.
 
-The first implementation is intentionally batch=1 and draft-eager.  It is an
+The first implementation is intentionally batch=1 and draft-eager. It is an
 experimental long-context path until acceptance/throughput are measured on the
 real SM75 host.
 """
@@ -95,7 +95,7 @@ def filter_dflash2_private_kv_specs(
 ) -> list[dict[str, Any]]:
     """Remove DFlash attention specs from EngineCore planning in private mode.
 
-    Worker RPC still reports the draft Attention modules.  Filtering centrally
+    Worker RPC still reports the draft Attention modules. Filtering centrally
     avoids depending on model-construction/monkeypatch ordering and restores the
     target model's exact native KV grouping inputs.
     """
@@ -156,8 +156,8 @@ def _advance_window_state(
     """Track a contiguous suffix without retaining stale data across requests.
 
     Small overlaps are allowed because rejection/replay can revisit a handful of
-    recent positions.  A position-0 chunk, a forward gap, or a large backwards
-    jump starts a new private-cache epoch.  Prefix-cache hits that start at a
+    recent positions. A position-0 chunk, a forward gap, or a large backwards
+    jump starts a new private-cache epoch. Prefix-cache hits that start at a
     non-zero position are therefore represented by the suffix actually observed
     by DFlash rather than by stale data from a previous request.
     """
@@ -191,11 +191,10 @@ def install_dflash2_private_kv_worker_compat() -> bool:
     # Imports are intentionally lazy so EngineCore can use the spec-filter helper
     # without importing CUDA/model-runner modules.
     from vllm import _custom_ops as ops
-    from vllm.v1.attention.backend import CommonAttentionMetadata
-    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-    from vllm.v1.config import CUDAGraphMode if False else None  # type: ignore
     from vllm.config import CUDAGraphMode
     from vllm.model_executor.models import qwen3_dflash as dflash_model
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
     from vllm.v1.spec_decode.dflash import DFlashProposer
 
     # ------------------------------------------------------------------
@@ -257,7 +256,7 @@ def install_dflash2_private_kv_worker_compat() -> bool:
                 all_k = k
                 all_v = v
 
-            # [1, heads, query, dim] x [1, kv_heads, context, dim].  RoPE is
+            # [1, heads, query, dim] x [1, kv_heads, context, dim]. RoPE is
             # already applied to Q/K, and DFlash uses non-causal attention for
             # its bonus+mask query lattice, so physical ring order is irrelevant.
             q_sdpa = q.transpose(0, 1).unsqueeze(0)
@@ -300,7 +299,7 @@ def install_dflash2_private_kv_worker_compat() -> bool:
 
             dtype = self._fused_kv_weight.dtype
             device = self._fused_kv_weight.device
-            cache = torch.empty(
+            private_cache = torch.empty(
                 (
                     self._num_attn_layers,
                     2,
@@ -320,11 +319,11 @@ def install_dflash2_private_kv_worker_compat() -> bool:
                 "arange": torch.arange(window, dtype=torch.long, device=device),
                 "slot_indices": torch.empty(window, dtype=torch.long, device=device),
             }
-            self._dflash_private_kv_cache = cache
+            self._dflash_private_kv_cache = private_cache
             self._dflash_private_kv_state = state
             for layer_idx, layer in enumerate(self.layers):
                 outer_attn = layer.self_attn
-                outer_attn._dflash_private_cache = cache[layer_idx]
+                outer_attn._dflash_private_cache = private_cache[layer_idx]
                 outer_attn._dflash_private_state = state
 
             logger.info_once(
@@ -333,7 +332,7 @@ def install_dflash2_private_kv_worker_compat() -> bool:
                 "target KV sizing accounts for it.",
                 window,
                 self._num_attn_layers,
-                cache.numel() * cache.element_size() / 2**20,
+                private_cache.numel() * private_cache.element_size() / 2**20,
                 dtype,
             )
 
@@ -351,7 +350,7 @@ def install_dflash2_private_kv_worker_compat() -> bool:
                     self, context_states, context_positions, context_slot_mapping
                 )
 
-            # A single target chunk can exceed the entire draft window.  Do not
+            # A single target chunk can exceed the entire draft window. Do not
             # project K/V that can never be observed by the draft.
             if context_states.shape[0] > window:
                 context_states = context_states[-window:]
@@ -414,12 +413,12 @@ def install_dflash2_private_kv_worker_compat() -> bool:
             positions_i64 = context_positions.to(torch.long)
             slots = positions_i64.remainder(window)
             all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
-            cache = self._dflash_private_kv_cache
-            cache[:, 0].index_copy_(1, slots, all_k_final)
-            cache[:, 1].index_copy_(1, slots, all_v)
+            private_cache = self._dflash_private_kv_cache
+            private_cache[:, 0].index_copy_(1, slots, all_k_final)
+            private_cache[:, 1].index_copy_(1, slots, all_v)
 
             # One small host read per proposal keeps the five layer forwards free
-            # of dynamic GPU reductions.  The draft is eager on the validated SM75
+            # of dynamic GPU reductions. The draft is eager on the validated SM75
             # path; this is intentionally correctness/long-context first.
             first_pos = int(context_positions[0].item())
             last_pos = int(context_positions[-1].item())
@@ -587,9 +586,7 @@ def install_dflash2_private_kv_worker_compat() -> bool:
         @wraps(original_initialize_cg)
         def initialize_cudagraph_keys_private(self, cudagraph_mode):
             if getattr(self, "_is_dflash2", False):
-                self.cudagraph_dispatcher.initialize_cudagraph_keys(
-                    CUDAGraphMode.NONE
-                )
+                self.cudagraph_dispatcher.initialize_cudagraph_keys(CUDAGraphMode.NONE)
                 logger.info_once(
                     "DFlash2 private KV forces the draft model eager; target CUDA "
                     "Graph remains independently enabled."
