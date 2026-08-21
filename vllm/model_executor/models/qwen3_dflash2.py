@@ -61,6 +61,18 @@ def _flashinfer_topk() -> Callable[..., tuple[torch.Tensor, torch.Tensor]] | Non
 def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Use FlashInfer when it works on this GPU, otherwise permanently fall back."""
     global _flashinfer_topk_broken
+    if scores.is_cuda and torch.cuda.get_device_capability(scores.device)[0] < 8:
+        # FlashInfer 0.6.8 can silently return corrupt indices on SM75 for the
+        # large vocab/logit layout used by DFlash2. An exception-based fallback
+        # cannot protect correctness, so keep all Turing paths on torch.topk.
+        major, minor = torch.cuda.get_device_capability(scores.device)
+        logger.warning_once(
+            "DFlash2 using torch.topk on SM%d%d; FlashInfer top_k is disabled "
+            "because this Turing path can return incorrect indices.",
+            major,
+            minor,
+        )
+        return torch.topk(scores, k, dim=-1)
     impl = None if _flashinfer_topk_broken else _flashinfer_topk()
     if impl is None or not scores.is_cuda:
         return torch.topk(scores, k, dim=-1)
