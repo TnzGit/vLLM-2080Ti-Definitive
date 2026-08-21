@@ -229,44 +229,39 @@ def install_dflash2_flex_attention_compat() -> None:
         ) -> torch.Tensor:
             restore_metadata: Callable[[], None] | None = None
             if kv_cache is not None and not kv_cache.is_contiguous():
-                # The legacy FlexAttention forward flattens K/V with view().
-                # Prefer an active-block compact view for the batch=1 path.
-                # Do not silently materialize the entire padded pool for a
-                # multi-request batch: that path can consume hundreds of MiB
-                # and take EngineCore down under real production load.
-                if attn_metadata is not None and getattr(
-                    attn_metadata, "num_reqs", 0
-                ) > 1:
-                    raise RuntimeError(
-                        "DFlash2 padded heterogeneous KV currently supports "
-                        "batch=1 only; set max_num_seqs=1. Multi-request KV "
-                        "compaction is not implemented, so refusing the "
-                        "unsafe full-pool contiguous fallback."
-                    )
-                if attn_metadata is not None and getattr(
-                    attn_metadata, "block_mask", None
-                ) is None:
-                    # Metadata is normally pre-built by the builder, but the
-                    # first eager request can arrive before that lazy build.
-                    # Build it here so the compact path also covers request 1
-                    # instead of taking a full-pool snapshot once.
-                    if attn_metadata.direct_build:
-                        attn_metadata.block_mask = attn_metadata._build_block_mask_direct()
-                    else:
-                        attn_metadata.block_mask = attn_metadata.build_block_mask()
-                compact = (
-                    _compact_single_request_kv(kv_cache, attn_metadata)
-                    if attn_metadata is not None
-                    else None
-                )
-                if compact is not None:
-                    kv_cache, restore_metadata = compact
-                else:
+                # Profiling/KV initialization calls this hook without request
+                # metadata; keep the one required contiguous snapshot there.
+                if attn_metadata is None:
                     kv_cache = kv_cache.contiguous()
                     logger.info_once(
                         "DFlash2 FlexAttention compatibility materialized a "
                         "contiguous KV view for padded heterogeneous KV cache."
                     )
+                else:
+                    # Real requests must use compact active-block KV. Never
+                    # silently materialize the full padded pool on a metadata
+                    # miss or an unsupported batch shape.
+                    if getattr(attn_metadata, "num_reqs", 0) > 1:
+                        raise RuntimeError(
+                            "DFlash2 padded heterogeneous KV currently supports "
+                            "batch=1 only; set max_num_seqs=1. Multi-request KV "
+                            "compaction is not implemented, so refusing the "
+                            "unsafe full-pool contiguous fallback."
+                        )
+                    if getattr(attn_metadata, "block_mask", None) is None:
+                        # Metadata is normally pre-built by the builder, but the
+                        # first eager request can arrive before that lazy build.
+                        if attn_metadata.direct_build:
+                            attn_metadata.block_mask = attn_metadata._build_block_mask_direct()
+                        else:
+                            attn_metadata.block_mask = attn_metadata.build_block_mask()
+                    compact = _compact_single_request_kv(kv_cache, attn_metadata)
+                    if compact is None:
+                        raise RuntimeError(
+                            "DFlash2 compact KV unavailable; refusing unsafe "
+                            "full-pool snapshot."
+                        )
+                    kv_cache, restore_metadata = compact
 
             try:
                 return original_forward(
