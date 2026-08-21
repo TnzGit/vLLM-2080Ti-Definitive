@@ -4,18 +4,27 @@
 
 import torch
 
-from vllm.v1.core.dflash_kv_compat import install_dflash2_heterogeneous_kv_compat
-from vllm.v1.core.dflash_kv_worker_compat import install_dflash2_worker_kv_compat
-from vllm.v1.core.dflash2_flex_attention_compat import (
-    install_dflash2_flex_attention_compat,
+from vllm.v1.core.dflash_private_kv import (
+    dflash_private_kv_enabled,
+    install_dflash2_private_kv_worker_compat,
 )
 
-# The central KV planner runs in EngineCore, while the actual cache reshape and
-# TurboQuant store kernels execute in worker processes. The DFlash2 model loader
-# installs worker-side compatibility hooks for the remaining execution paths.
-install_dflash2_heterogeneous_kv_compat()
-install_dflash2_worker_kv_compat()
-install_dflash2_flex_attention_compat()
+# The central KV planner runs in EngineCore, while model/cache execution lives
+# in worker processes.  Keep the proven managed/padded path as the default.
+# The opt-in private/windowed path deliberately bypasses those hooks so the
+# target's native KV layout is not perturbed by DFlash at all.
+if dflash_private_kv_enabled():
+    install_dflash2_private_kv_worker_compat()
+else:
+    from vllm.v1.core.dflash_kv_compat import install_dflash2_heterogeneous_kv_compat
+    from vllm.v1.core.dflash_kv_worker_compat import install_dflash2_worker_kv_compat
+    from vllm.v1.core.dflash2_flex_attention_compat import (
+        install_dflash2_flex_attention_compat,
+    )
+
+    install_dflash2_heterogeneous_kv_compat()
+    install_dflash2_worker_kv_compat()
+    install_dflash2_flex_attention_compat()
 
 from .dflash2_dtype_compat import combine_dflash2_hidden_states  # noqa: E402
 from .qwen3_dflash2 import (  # noqa: E402
