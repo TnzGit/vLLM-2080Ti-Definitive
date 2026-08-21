@@ -8,6 +8,7 @@ keeping the existing DFlash proposer architecture used by this repository.
 
 from collections.abc import Callable
 from functools import cache
+import os
 
 import torch
 import torch.nn.functional as F
@@ -18,6 +19,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
@@ -39,6 +41,24 @@ from .qwen3_dflash import (
 from .utils import maybe_prefix
 
 logger = init_logger(__name__)
+
+
+def _fp32_island_enabled() -> bool:
+    return os.environ.get("VLLM_DFLASH_FP32_ISLAND") == "1"
+
+
+def _fp32_rms_norm_add(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    norm: nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    combined = hidden_states.float()
+    if residual is not None:
+        combined = combined + residual.float()
+    variance = combined.square().mean(dim=-1, keepdim=True)
+    weight = norm.weight.float()
+    normalized = combined * torch.rsqrt(variance + norm.variance_epsilon) * weight
+    return normalized, combined
 
 _flashinfer_topk_broken = False
 
@@ -168,6 +188,10 @@ class DFlashGroupedConv(nn.Module):
     def finish(
         self, hidden_states: torch.Tensor, coefficients: torch.Tensor
     ) -> torch.Tensor:
+        if _fp32_island_enabled():
+            return self._convolve(
+                hidden_states.float(), coefficients.float(), 1
+            )
         return self._convolve(hidden_states, coefficients, 1)
 
 
@@ -215,19 +239,39 @@ class DFlash2Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+        if _fp32_island_enabled():
+            hidden_states, residual = _fp32_rms_norm_add(
+                hidden_states, residual, self.input_layernorm
+            )
+            hidden_states = hidden_states.to(self.input_layernorm.weight.dtype)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         hidden_states, coefficients = self.attention_conv.prepare(hidden_states)
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
         hidden_states = self.attention_conv.finish(hidden_states, coefficients)
 
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if _fp32_island_enabled():
+            hidden_states, residual = _fp32_rms_norm_add(
+                hidden_states, residual, self.post_attention_layernorm
+            )
+            hidden_states = hidden_states.to(self.post_attention_layernorm.weight.dtype)
+        else:
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states, coefficients = self.mlp_conv.prepare(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        if _fp32_island_enabled():
+            gate_up, _ = self.mlp.gate_up_proj(hidden_states)
+            activated = self.mlp.act_fn(gate_up)
+            local = F.linear(
+                activated.float(), self.mlp.down_proj.weight.float(), bias=None
+            )
+            hidden_states = tensor_model_parallel_all_reduce(local)
+        else:
+            hidden_states = self.mlp(hidden_states)
         hidden_states = self.mlp_conv.finish(hidden_states, coefficients)
         return hidden_states, residual
 
@@ -346,6 +390,27 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return super().embed_input_ids(input_ids) * self.input_embedding_scale
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        input_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not _fp32_island_enabled():
+            return super().forward(input_ids, positions, input_embeds)
+        if input_embeds is None:
+            input_embeds = self.embed_input_ids(input_ids)
+        hidden_states = input_embeds
+        residual = None
+        for layer in self.layers:
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+        hidden_states, _ = _fp32_rms_norm_add(hidden_states, residual, self.norm)
+        return hidden_states.to(input_embeds.dtype)
 
 
 class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
