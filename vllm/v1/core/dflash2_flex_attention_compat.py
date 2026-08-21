@@ -97,14 +97,20 @@ def _remap_block_indices_into(
     remap: torch.Tensor,
     output: torch.Tensor | None,
 ) -> torch.Tensor | None:
+    """Remap BlockMask indices without a Python-visible CUDA reduction.
+
+    ``Tensor.any()`` in a Python branch synchronizes the host with the device.
+    This helper sits on the per-proposal compact-mapping path, so keep the whole
+    operation asynchronous: gather using clamped indices, then mask invalid
+    entries in-place.
+    """
     if indices is None:
         return None
     if output is None or output.shape != indices.shape or output.dtype != indices.dtype:
         output = torch.empty_like(indices)
-    valid = indices >= 0
-    output.fill_(-1)
-    if valid.any():
-        output[valid] = remap[indices[valid].long()].to(indices.dtype)
+    safe_indices = indices.clamp_min(0).long()
+    output.copy_(remap[safe_indices].to(indices.dtype))
+    output.masked_fill_(indices < 0, -1)
     return output
 
 
@@ -256,8 +262,6 @@ def _compact_single_request_kv(
     if block_mask is None or state is None or not state.get("prepared"):
         return None
 
-    # The compact path is explicitly batch=1; avoid a GPU->CPU sync here.
-    req = 0
     block_size = int(attn_metadata.block_size)
     num_active = (int(attn_metadata.max_seq_len) + block_size - 1) // block_size
     if num_active <= 0:
