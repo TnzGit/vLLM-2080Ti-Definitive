@@ -10,6 +10,9 @@ from vllm.v1.core.dflash_private_kv import (
     filter_dflash2_private_kv_specs,
     get_dflash_private_kv_window,
 )
+from vllm.v1.core.dflash_private_kv_anchor import (
+    select_private_metadata_anchor_gid,
+)
 
 
 class _Spec:
@@ -83,6 +86,25 @@ def test_private_filter_fails_closed_when_draft_specs_are_missing(monkeypatch):
     }
     with pytest.raises(RuntimeError, match="could not identify all draft attention specs"):
         filter_dflash2_private_kv_specs(_config(), [specs])
+
+
+def test_private_metadata_anchor_uses_first_nonempty_target_group():
+    config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(layer_names=[]),
+            SimpleNamespace(layer_names=["model.layers.0.linear_attn"]),
+            SimpleNamespace(layer_names=["model.layers.5.self_attn.attn"]),
+        ]
+    )
+    assert select_private_metadata_anchor_gid(config) == 1
+
+
+def test_private_metadata_anchor_fails_without_target_group():
+    config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(layer_names=[]), SimpleNamespace(layer_names=[])]
+    )
+    with pytest.raises(RuntimeError, match="at least one managed target KV group"):
+        select_private_metadata_anchor_gid(config)
 
 
 def test_window_state_extends_and_rolls():
