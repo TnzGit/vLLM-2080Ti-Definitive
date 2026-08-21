@@ -94,14 +94,7 @@ def _remap_block_indices(
 def _compact_single_request_kv(
     kv_cache: torch.Tensor, attn_metadata: Any
 ) -> tuple[torch.Tensor, Callable[[], None]] | None:
-    """Pack only the active physical blocks for the batch=1 DFlash2 path.
-
-    The old compatibility path materializes the entire padded KV pool.  For a
-    single request, the block table already identifies the small subset needed
-    by FlexAttention.  We temporarily remap its BlockMask and physical-to-
-    logical mapping to a compact block numbering, then restore metadata after
-    the forward call.
-    """
+    """Pack active blocks and reuse one workspace across attention layers."""
     if kv_cache.is_contiguous() or getattr(attn_metadata, "num_reqs", 0) != 1:
         return None
     block_mask = getattr(attn_metadata, "block_mask", None)
@@ -116,59 +109,91 @@ def _compact_single_request_kv(
     if num_active <= 0:
         return None
 
-    key_cache, value_cache = kv_cache.unbind(0)
-    block_ids = attn_metadata.block_table[req, :num_active].to(torch.long)
-    if block_ids.numel() != num_active:
-        return None
+    state = getattr(attn_metadata, "_dflash2_compact_state", None)
+    if state is None or state["block_table"] is not attn_metadata.block_table:
+        key_cache, value_cache = kv_cache.unbind(0)
+        block_ids = attn_metadata.block_table[req, :num_active].to(torch.long)
+        if block_ids.numel() != num_active:
+            return None
 
-    compact_key = key_cache.index_select(0, block_ids)
-    compact_value = value_cache.index_select(0, block_ids)
-    compact_kv = torch.stack((compact_key, compact_value), dim=0)
+        old_block_table = attn_metadata.block_table
+        old_physical_to_logical = attn_metadata.physical_to_logical
+        old_total_cache_tokens = attn_metadata.total_cache_tokens
+        old_num_blocks = attn_metadata.num_blocks
+        old_seq_lengths = block_mask.seq_lengths
+        old_kv_indices = block_mask.kv_indices
+        old_full_kv_indices = block_mask.full_kv_indices
 
-    remap = torch.full(
-        (key_cache.shape[0],), -1, dtype=torch.long, device=block_ids.device
-    )
-    remap[block_ids] = torch.arange(num_active, device=block_ids.device)
+        remap = torch.full(
+            (key_cache.shape[0],), -1, dtype=torch.long, device=block_ids.device
+        )
+        remap[block_ids] = torch.arange(num_active, device=block_ids.device)
 
-    old_block_table = attn_metadata.block_table
-    old_physical_to_logical = attn_metadata.physical_to_logical
-    old_total_cache_tokens = attn_metadata.total_cache_tokens
-    old_num_blocks = attn_metadata.num_blocks
-    old_seq_lengths = block_mask.seq_lengths
-    old_kv_indices = block_mask.kv_indices
-    old_full_kv_indices = block_mask.full_kv_indices
+        compact_block_table = torch.full_like(old_block_table, -1)
+        compact_block_table[req, :num_active] = torch.arange(
+            num_active, device=old_block_table.device, dtype=old_block_table.dtype
+        )
+        compact_physical_to_logical = torch.full_like(old_physical_to_logical, -1)
+        compact_physical_to_logical[req, :num_active] = old_physical_to_logical[
+            req, block_ids
+        ]
+        compact_kv_indices = _remap_block_indices(old_kv_indices, remap)
+        compact_full_kv_indices = _remap_block_indices(old_full_kv_indices, remap)
+        compact_kv = torch.empty(
+            (2, num_active, *kv_cache.shape[2:]),
+            dtype=kv_cache.dtype,
+            device=kv_cache.device,
+        )
+        state = {
+            "block_table": old_block_table,
+            "physical_to_logical": old_physical_to_logical,
+            "total_cache_tokens": old_total_cache_tokens,
+            "num_blocks": old_num_blocks,
+            "seq_lengths": old_seq_lengths,
+            "kv_indices": old_kv_indices,
+            "full_kv_indices": old_full_kv_indices,
+            "block_mask": block_mask,
+            "block_ids": block_ids,
+            "compact_kv": compact_kv,
+            "compact_block_table": compact_block_table,
+            "compact_physical_to_logical": compact_physical_to_logical,
+            "compact_kv_indices": compact_kv_indices,
+            "compact_full_kv_indices": compact_full_kv_indices,
+            "compact_seq_lengths": (old_seq_lengths[0], num_active * block_size),
+            "num_active": num_active,
+        }
+        attn_metadata._dflash2_compact_state = state
+    else:
+        # A metadata object is shared by all attention layers in one forward.
+        # Reuse its remap tensors and only refill the layer-local KV workspace.
+        compact_kv = state["compact_kv"]
+        if tuple(compact_kv.shape[2:]) != tuple(kv_cache.shape[2:]):
+            return None
 
-    compact_block_table = torch.full_like(old_block_table, -1)
-    compact_block_table[req, :num_active] = torch.arange(
-        num_active, device=old_block_table.device, dtype=old_block_table.dtype
-    )
-    compact_physical_to_logical = torch.full_like(old_physical_to_logical, -1)
-    compact_physical_to_logical[req, :num_active] = old_physical_to_logical[
-        req, block_ids
-    ]
-
-    attn_metadata.block_table = compact_block_table
-    attn_metadata.physical_to_logical = compact_physical_to_logical
-    attn_metadata.total_cache_tokens = num_active * block_size
-    attn_metadata.num_blocks = num_active
-    block_mask.kv_indices = _remap_block_indices(old_kv_indices, remap)
-    block_mask.full_kv_indices = _remap_block_indices(old_full_kv_indices, remap)
-    block_mask.seq_lengths = (old_seq_lengths[0], num_active * block_size)
+    torch.index_select(kv_cache, 1, state["block_ids"], out=state["compact_kv"])
+    compact_kv = state["compact_kv"]
+    attn_metadata.block_table = state["compact_block_table"]
+    attn_metadata.physical_to_logical = state["compact_physical_to_logical"]
+    attn_metadata.total_cache_tokens = state["num_active"] * block_size
+    attn_metadata.num_blocks = state["num_active"]
+    block_mask.kv_indices = state["compact_kv_indices"]
+    block_mask.full_kv_indices = state["compact_full_kv_indices"]
+    block_mask.seq_lengths = state["compact_seq_lengths"]
 
     def restore() -> None:
-        attn_metadata.block_table = old_block_table
-        attn_metadata.physical_to_logical = old_physical_to_logical
-        attn_metadata.total_cache_tokens = old_total_cache_tokens
-        attn_metadata.num_blocks = old_num_blocks
-        block_mask.kv_indices = old_kv_indices
-        block_mask.full_kv_indices = old_full_kv_indices
-        block_mask.seq_lengths = old_seq_lengths
+        attn_metadata.block_table = state["block_table"]
+        attn_metadata.physical_to_logical = state["physical_to_logical"]
+        attn_metadata.total_cache_tokens = state["total_cache_tokens"]
+        attn_metadata.num_blocks = state["num_blocks"]
+        block_mask.kv_indices = state["kv_indices"]
+        block_mask.full_kv_indices = state["full_kv_indices"]
+        block_mask.seq_lengths = state["seq_lengths"]
 
     logger.info_once(
         "DFlash2 FlexAttention using active-block compact KV for batch=1 "
         "(%d/%d blocks, %.1f MiB logical cache).",
         num_active,
-        key_cache.shape[0],
+        kv_cache.shape[1],
         compact_kv.numel() * compact_kv.element_size() / 2**20,
     )
     return compact_kv, restore
