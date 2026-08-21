@@ -812,8 +812,28 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             skip_prefixes=None,
             skip_substrs=skip_substrs,
         )
-        loader.load_weights(model_weights.items())
+        loaded_params = loader.load_weights(model_weights.items())
+        if hasattr(self.model, "candidate_selector"):
+            critical = {
+                name
+                for name, _ in self.named_parameters()
+                if "candidate_selector." in name
+                or ".attention_conv." in name
+                or ".mlp_conv." in name
+            }
+            missing = sorted(critical - loaded_params)
+            if missing:
+                preview = ", ".join(missing[:12])
+                raise RuntimeError(
+                    "DFlash2 critical weight coverage incomplete: "
+                    f"{len(missing)} missing ({preview})"
+                )
+            logger.info(
+                "DFlash2 critical weight coverage complete: %d parameters loaded.",
+                len(critical),
+            )
         self.model._build_fused_kv_buffers()
+        return loaded_params
 
     def _read_mask_embedding(self) -> torch.Tensor | None:
         """Checks for an override mask embedding in `mask_embedding.pt` and returns it.

@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import replace
 from typing import Any
 
 import torch
 from typing_extensions import override
 
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.spec_decode.dflash2 import dflash2_greedy_sample
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.spec_decode.utils import (
     copy_and_expand_dflash_inputs_kernel,
@@ -18,6 +20,34 @@ from vllm.v1.spec_decode.utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _resolve_dflash_draft_cudagraph(device: torch.device) -> tuple[bool, str]:
+    """Resolve whether the DFlash draft itself should use CUDA Graph.
+
+    On the validated SM75 path, PIECEWISE graphs for the target provide almost
+    all of the throughput benefit while graphing the draft consumes substantial
+    extra VRAM. Keep the draft eager by default on pre-SM80 CUDA devices, with
+    an environment override for benchmarking or future kernels.
+    """
+    raw = os.environ.get("VLLM_DFLASH_DRAFT_CUDAGRAPH", "auto").strip().lower()
+    if raw in {"1", "on", "true", "yes"}:
+        return True, "forced-on"
+    if raw in {"0", "off", "false", "no"}:
+        return False, "forced-off"
+    if raw not in {"", "auto"}:
+        logger.warning_once(
+            "Unrecognized VLLM_DFLASH_DRAFT_CUDAGRAPH=%r; using auto mode.", raw
+        )
+
+    if device.type == "cuda":
+        try:
+            major, minor = torch.cuda.get_device_capability(device)
+            if major < 8:
+                return False, f"auto-sm{major}{minor}"
+        except (RuntimeError, AssertionError):
+            pass
+    return True, "auto"
 
 
 class DFlashProposer(SpecDecodeBaseProposer):
@@ -36,14 +66,36 @@ class DFlashProposer(SpecDecodeBaseProposer):
             runner=runner,
         )
 
-        # Only next_token_ids and mask tokens are query tokens, all other context is K/V
+        # Only next_token_ids and mask tokens are query tokens, all other
+        # context is K/V.
         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
-        self.max_padded_query_tokens = max(
-            self.max_query_tokens,
-            vllm_config.compilation_config.max_cudagraph_capture_size or 0,
+        # CUDA-graph padding can be slightly larger than the logical query count.
+        graph_capacity = int(self.compilation_config.max_cudagraph_capture_size or 0)
+        self._query_buffer_capacity = max(self.max_query_tokens, graph_capacity)
+        # Positions covers both context states + query states.
+        self.max_positions = self.max_num_tokens + self._query_buffer_capacity
+
+        # The base proposer allocates input_ids/inputs_embeds for
+        # max_num_batched_tokens. DFlash is parallel-drafting and only feeds the
+        # small query batch through the draft model; context hidden states are
+        # precomputed directly into KV. Replace the oversized query-only buffers
+        # with graph-safe query-capacity buffers.
+        self.input_ids = torch.zeros(
+            self._query_buffer_capacity,
+            dtype=torch.int32,
+            device=device,
         )
-        # Positions covers both context states + query states
-        self.max_positions = self.max_num_tokens + self.max_padded_query_tokens
+        self.inputs_embeds = torch.zeros(
+            (self._query_buffer_capacity, self.inputs_embeds_size),
+            dtype=self.dtype,
+            device=device,
+        )
+        logger.info_once(
+            "DFlash query buffers capped at %d tokens "
+            "(base max_num_batched_tokens=%d).",
+            self._query_buffer_capacity,
+            self.max_num_tokens,
+        )
 
         # Separate context buffers to keep query buffer addresses stable for CUDA graphs
         self._context_slot_mapping_buffer = torch.zeros(
@@ -52,7 +104,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             device=device,
         )
         self._slot_mapping_buffer = torch.zeros(
-            self.max_padded_query_tokens,
+            self._query_buffer_capacity,
             dtype=torch.int64,
             device=device,
         )
@@ -62,8 +114,13 @@ class DFlashProposer(SpecDecodeBaseProposer):
             device=device,
         )
         self.positions = torch.zeros(
-            self.max_padded_query_tokens,
+            self._query_buffer_capacity,
             dtype=torch.int64,
+            device=device,
+        )
+        self._token_indices_to_sample_buffer = torch.empty(
+            self.max_batch_size * self.num_speculative_tokens,
+            dtype=torch.int32,
             device=device,
         )
 
@@ -78,6 +135,43 @@ class DFlashProposer(SpecDecodeBaseProposer):
 
         self.dflash_causal = not dflash_has_any_non_causal(
             self.draft_model_config.hf_config
+        )
+
+        dflash_config = getattr(self.draft_model_config.hf_config, "dflash_config", {})
+        dflash_config = dflash_config or {}
+        architectures = (
+            getattr(self.draft_model_config.hf_config, "architectures", ()) or ()
+        )
+        self._is_dflash2 = "DFlash2DraftModel" in architectures or (
+            "selector_rank" in dflash_config
+            and "selector_top_k" in dflash_config
+            and "conv_kernel_size" in dflash_config
+        )
+        if self._is_dflash2:
+            if self.speculative_config.draft_sample_method != "greedy":
+                raise ValueError(
+                    "This DFlash2 SM75 backport supports "
+                    "draft_sample_method='greedy' only. Probabilistic/Gumbel "
+                    "DFlash2 requires the Model Runner V2 proposal-"
+                    "distribution contract."
+                )
+            if self.use_local_argmax_reduction:
+                logger.info_once(
+                    "Ignoring use_local_argmax_reduction for DFlash2: its "
+                    "candidate selector already performs local top-k followed "
+                    "by a small TP gather."
+                )
+                self.use_local_argmax_reduction = False
+
+    @override
+    def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not self._is_dflash2:
+            return super()._greedy_sample(hidden_states)
+        return dflash2_greedy_sample(
+            self.model,
+            self.input_ids,
+            hidden_states,
+            self.num_speculative_tokens,
         )
 
     @override
@@ -126,11 +220,10 @@ class DFlashProposer(SpecDecodeBaseProposer):
         # does not run in a CUDA graph
         self._dflash_hidden_states = target_hidden_states
 
-        token_indices_to_sample = torch.empty(
-            batch_size * self.num_speculative_tokens,
-            dtype=torch.int32,
-            device=self.device,
-        )
+        num_sample_indices = batch_size * self.num_speculative_tokens
+        token_indices_to_sample = self._token_indices_to_sample_buffer[
+            :num_sample_indices
+        ]
 
         # Launch fused triton kernel for input_ids, positions, slot_mapping,
         # and token_indices_to_sample
@@ -298,6 +391,19 @@ class DFlashProposer(SpecDecodeBaseProposer):
         per_group, per_layer = super().build_per_group_and_layer_attn_metadata(
             cad, draft_index
         )
+        # DFlash2's padded KV compatibility needs one stable compact mapping
+        # per proposal. FlexAttention is invoked once per participating layer;
+        # preparing here avoids refreshing identical block metadata per layer.
+        if self._is_dflash2:
+            from vllm.v1.core.dflash2_flex_attention_compat import (
+                prepare_dflash2_compact_mapping,
+            )
+
+            seen: set[int] = set()
+            for attn_metadata in per_group:
+                if id(attn_metadata) not in seen:
+                    prepare_dflash2_compact_mapping(attn_metadata)
+                    seen.add(id(attn_metadata))
         if not self.dflash_causal:
             # Require all layers to support non-causal attention when required by DFlash
             for layer_name, attn_metadata in per_layer.items():
@@ -307,6 +413,36 @@ class DFlashProposer(SpecDecodeBaseProposer):
                     " Consider using a different attention backend, e.g FlashAttention."
                 )
         return per_group, per_layer
+
+    @override
+    def initialize_cudagraph_keys(self, cudagraph_mode):
+        if self._is_dflash2:
+            if self.speculative_config.enforce_eager:
+                draft_graph_enabled = False
+                graph_reason = "speculative_config.enforce_eager"
+            else:
+                draft_graph_enabled, graph_reason = _resolve_dflash_draft_cudagraph(
+                    self.device
+                )
+
+            if draft_graph_enabled:
+                super().initialize_cudagraph_keys(cudagraph_mode)
+            else:
+                self.cudagraph_dispatcher.initialize_cudagraph_keys(CUDAGraphMode.NONE)
+
+            descriptors = self.cudagraph_dispatcher.get_capture_descs()
+            logger.info(
+                "DFlash2 draft CUDA Graph enabled=%s reason=%s descriptors=%s",
+                draft_graph_enabled,
+                graph_reason,
+                [
+                    (mode.name, [d.num_tokens for d in descs])
+                    for mode, descs in descriptors
+                ],
+            )
+            return
+
+        super().initialize_cudagraph_keys(cudagraph_mode)
 
     @override
     def _get_eagle3_use_aux_hidden_state_from_config(self):
