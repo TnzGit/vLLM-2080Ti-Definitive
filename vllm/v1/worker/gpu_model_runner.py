@@ -6146,6 +6146,14 @@ class GPUModelRunner(
 
         capture_descs = self.cudagraph_dispatcher.get_capture_descs()
 
+        logger.info(
+            "Target CUDA Graph capture descriptors: %s",
+            [
+                (mode.name, [d.num_tokens for d in descs])
+                for mode, descs in capture_descs
+            ],
+        )
+
         total_graphs = sum(len(descs) for _, descs in capture_descs)
         if total_graphs == 0:
             logger.debug("No CUDA graphs will be captured, skipping profiling")
