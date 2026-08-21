@@ -26,6 +26,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _INSTALLED = False
+_COMPACT_WORKSPACE_POOL: dict[tuple[Any, ...], dict[str, Any]] = {}
 
 
 def _is_power_of_two(value: int) -> bool:
@@ -91,6 +92,32 @@ def _remap_block_indices(
     return torch.where(valid, mapped, torch.full_like(indices, -1))
 
 
+def _get_compact_kv_workspace(
+    kv_cache: torch.Tensor, num_active: int, max_capacity: int
+) -> torch.Tensor:
+    """Return a process-local compact KV buffer shared across requests/layers."""
+    key = (
+        kv_cache.device.type,
+        kv_cache.device.index,
+        kv_cache.dtype,
+        tuple(kv_cache.shape[2:]),
+    )
+    pool = _COMPACT_WORKSPACE_POOL.get(key)
+    if pool is None or pool["capacity"] < num_active:
+        capacity = min(
+            max_capacity,
+            max(num_active, pool["capacity"] * 2 if pool else num_active),
+        )
+        buffer = torch.empty(
+            (2, capacity, *kv_cache.shape[2:]),
+            dtype=kv_cache.dtype,
+            device=kv_cache.device,
+        )
+        pool = {"capacity": capacity, "buffer": buffer}
+        _COMPACT_WORKSPACE_POOL[key] = pool
+    return pool["buffer"][:, :num_active]
+
+
 def _compact_single_request_kv(
     kv_cache: torch.Tensor, attn_metadata: Any
 ) -> tuple[torch.Tensor, Callable[[], None]] | None:
@@ -138,10 +165,13 @@ def _compact_single_request_kv(
         ]
         compact_kv_indices = _remap_block_indices(old_kv_indices, remap)
         compact_full_kv_indices = _remap_block_indices(old_full_kv_indices, remap)
-        compact_kv = torch.empty(
-            (2, num_active, *kv_cache.shape[2:]),
-            dtype=kv_cache.dtype,
-            device=kv_cache.device,
+        max_capacity = min(
+            (int(attn_metadata.max_possible_sequence_length) + block_size - 1)
+            // block_size,
+            int(kv_cache.shape[1]),
+        )
+        compact_kv = _get_compact_kv_workspace(
+            kv_cache, num_active, max(max_capacity, num_active)
         )
         state = {
             "block_table": old_block_table,
