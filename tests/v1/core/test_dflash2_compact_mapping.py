@@ -2,8 +2,10 @@ import torch
 
 from vllm.v1.core.dflash2_flex_attention_compat import (
     _compact_single_request_kv,
+    _remap_block_indices_into,
     prepare_dflash2_compact_mapping,
 )
+from vllm.v1.spec_decode.dflash import _resolve_dflash_draft_cudagraph
 
 
 class _BlockMask:
@@ -54,3 +56,32 @@ def test_mapping_refreshes_when_new_proposal_metadata_changes():
     state = metadata._dflash2_compact_state
     assert state["prepare_count"] == 1
     assert state["block_ids"][:2].tolist() == [3, 1]
+
+
+def test_remap_into_reuses_output_and_preserves_invalid_entries():
+    indices = torch.tensor([[-1, 2, 0]], dtype=torch.int32)
+    remap = torch.tensor([5, 6, 7], dtype=torch.int64)
+    output = torch.empty_like(indices)
+
+    result = _remap_block_indices_into(indices, remap, output)
+
+    assert result is output
+    assert result.tolist() == [[-1, 7, 5]]
+
+
+def test_dflash_draft_cudagraph_auto_disables_sm75(monkeypatch):
+    monkeypatch.delenv("VLLM_DFLASH_DRAFT_CUDAGRAPH", raising=False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (7, 5))
+
+    enabled, reason = _resolve_dflash_draft_cudagraph(torch.device("cuda"))
+
+    assert enabled is False
+    assert reason == "auto-sm75"
+
+
+def test_dflash_draft_cudagraph_can_be_forced_on(monkeypatch):
+    monkeypatch.setenv("VLLM_DFLASH_DRAFT_CUDAGRAPH", "1")
+    enabled, reason = _resolve_dflash_draft_cudagraph(torch.device("cuda"))
+
+    assert enabled is True
+    assert reason == "forced-on"
