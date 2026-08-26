@@ -1207,6 +1207,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             max_num_batched_tokens=self._gdn_workspace_max_num_batched_tokens,
             max_num_sequences=self._gdn_workspace_max_num_sequences,
             num_heads=num_v_heads,
+            num_key_heads=num_k_heads,
             key_dim=self.head_k_dim,
             value_dim=self.head_v_dim,
             dtype=dtype,

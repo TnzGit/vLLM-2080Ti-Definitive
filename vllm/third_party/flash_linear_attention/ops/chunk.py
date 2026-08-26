@@ -68,11 +68,61 @@ def _gdn_prefill_workspace_specs(
     )
 
 
+def _gdn_post_conv_workspace_specs(
+    *,
+    num_tokens: int,
+    num_key_heads: int,
+    num_value_heads: int,
+    key_dim: int,
+    value_dim: int,
+    dtype: torch.dtype,
+) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+    """Return the five post-conv outputs that stay live during FLA prefill."""
+    return (
+        ((num_tokens, num_key_heads, key_dim), dtype),  # q
+        ((num_tokens, num_key_heads, key_dim), dtype),  # k
+        ((num_tokens, num_value_heads, value_dim), dtype),  # v
+        ((num_tokens, num_value_heads), torch.float32),  # g
+        ((num_tokens, num_value_heads), torch.float32),  # beta
+    )
+
+
+def get_gdn_post_conv_workspace(
+    *,
+    num_tokens: int,
+    num_key_heads: int,
+    num_value_heads: int,
+    key_dim: int,
+    value_dim: int,
+    dtype: torch.dtype,
+) -> list[torch.Tensor] | None:
+    """Get stable output views for fused post-conv preparation.
+
+    The subsequent chunk call requests the same five specs first and places
+    its scratch after them.  This keeps q/k/v/g/beta live without aliasing the
+    recurrent scratch, while both stages share one fixed backing allocation.
+    """
+    manager = _workspace_manager()
+    if manager is None:
+        return None
+    return manager.get_simultaneous(
+        *_gdn_post_conv_workspace_specs(
+            num_tokens=num_tokens,
+            num_key_heads=num_key_heads,
+            num_value_heads=num_value_heads,
+            key_dim=key_dim,
+            value_dim=value_dim,
+            dtype=dtype,
+        )
+    )
+
+
 def reserve_gdn_prefill_workspace(
     *,
     max_num_batched_tokens: int,
     max_num_sequences: int,
     num_heads: int,
+    num_key_heads: int,
     key_dim: int,
     value_dim: int,
     dtype: torch.dtype,
@@ -90,7 +140,15 @@ def reserve_gdn_prefill_workspace(
         (max_num_batched_tokens + FLA_CHUNK_SIZE - 1) // FLA_CHUNK_SIZE
         + max(0, max_num_sequences - 1)
     )
-    specs = _gdn_prefill_workspace_specs(
+    post_conv_specs = _gdn_post_conv_workspace_specs(
+        num_tokens=max_num_batched_tokens,
+        num_key_heads=num_key_heads,
+        num_value_heads=num_heads,
+        key_dim=key_dim,
+        value_dim=value_dim,
+        dtype=dtype,
+    )
+    scratch_specs = _gdn_prefill_workspace_specs(
         batch_size=1,
         num_tokens=max_num_batched_tokens,
         num_heads=num_heads,
@@ -100,6 +158,7 @@ def reserve_gdn_prefill_workspace(
         num_chunks=num_chunks,
         num_sequences=max_num_sequences,
     )
+    specs = post_conv_specs + scratch_specs
     manager.get_simultaneous(*specs)
     return sum(prod(shape) * dt.itemsize for shape, dt in specs)
 
@@ -117,6 +176,7 @@ def _get_gdn_prefill_workspace(
     if manager is None:
         return None
     B, T, _Hg, K = k.shape
+    Hg = k.shape[-2]
     H = beta.shape[-1]
     V = v.shape[-1]
     if cu_seqlens is None:
@@ -138,7 +198,15 @@ def _get_gdn_prefill_workspace(
                 .sum()
                 .item()
             )
-    specs = list(
+    post_conv_specs = _gdn_post_conv_workspace_specs(
+        num_tokens=T,
+        num_key_heads=Hg,
+        num_value_heads=H,
+        key_dim=K,
+        value_dim=V,
+        dtype=k.dtype,
+    )
+    scratch_specs = list(
         _gdn_prefill_workspace_specs(
             batch_size=B,
             num_tokens=T,
@@ -151,8 +219,9 @@ def _get_gdn_prefill_workspace(
         )
     )
     if not output_final_state:
-        specs.pop()
-    return manager.get_simultaneous(*specs)
+        scratch_specs.pop()
+    outputs = manager.get_simultaneous(*post_conv_specs, *scratch_specs)
+    return outputs[len(post_conv_specs) :]
 
 
 def chunk_gated_delta_rule_fwd(
