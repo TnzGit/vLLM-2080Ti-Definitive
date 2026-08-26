@@ -195,12 +195,28 @@ def fused_post_conv_prep(
         f"qkv_dim={qkv_dim} != 2*H*K + HV*V = {2 * H * K + HV * V}"
     )
 
-    # Allocate outputs in target contiguous layout
-    q = torch.empty(L, H, K, dtype=dtype, device=device)
-    k = torch.empty(L, H, K, dtype=dtype, device=device)
-    v = torch.empty(L, HV, V, dtype=dtype, device=device)
-    g = torch.empty(L, HV, dtype=torch.float32, device=device)
-    beta = torch.empty(L, HV, dtype=torch.float32, device=device)
+    # Keep all five outputs in the fixed V1 workspace.  They remain live while
+    # chunk_gated_delta_rule runs, so that call lays its recurrent scratch out
+    # after these same five prefix views.  Outside a V1 worker, retain the
+    # standalone allocation behavior used by kernel tests and tooling.
+    from .chunk import get_gdn_post_conv_workspace
+
+    workspace_outputs = get_gdn_post_conv_workspace(
+        num_tokens=L,
+        num_key_heads=H,
+        num_value_heads=HV,
+        key_dim=K,
+        value_dim=V,
+        dtype=dtype,
+    )
+    if workspace_outputs is None:
+        q = torch.empty(L, H, K, dtype=dtype, device=device)
+        k = torch.empty(L, H, K, dtype=dtype, device=device)
+        v = torch.empty(L, HV, V, dtype=dtype, device=device)
+        g = torch.empty(L, HV, dtype=torch.float32, device=device)
+        beta = torch.empty(L, HV, dtype=torch.float32, device=device)
+    else:
+        q, k, v, g, beta = workspace_outputs
 
     if L == 0:
         return q, k, v, g, beta

@@ -7,6 +7,7 @@ import torch
 from vllm.third_party.flash_linear_attention.ops import chunk as chunk_module
 from vllm.third_party.flash_linear_attention.ops.chunk import (
     _gdn_prefill_workspace_specs,
+    get_gdn_post_conv_workspace,
 )
 from vllm.v1.worker.workspace import (
     init_workspace_manager,
@@ -105,11 +106,18 @@ def test_gdn_prefill_pipeline_wires_every_scratch_output(monkeypatch) -> None:
         lambda **kwargs: kwargs["core_attn_out"],
     )
 
-    q = torch.empty((1, 64, 4, 128), dtype=torch.float16)
-    k = torch.empty_like(q)
-    v = torch.empty_like(q)
-    g = torch.empty((1, 64, 4), dtype=torch.float16)
-    beta = torch.empty_like(g)
+    prep = get_gdn_post_conv_workspace(
+        num_tokens=64,
+        num_key_heads=4,
+        num_value_heads=4,
+        key_dim=128,
+        value_dim=128,
+        dtype=torch.float16,
+    )
+    assert prep is not None
+    prep_ptrs = {tensor.data_ptr() for tensor in prep}
+    assert len(prep_ptrs) == len(prep)
+    q, k, v, g, beta = (tensor.unsqueeze(0) for tensor in prep)
     state = torch.empty((1, 4, 128, 128), dtype=torch.float32)
     output = torch.empty_like(v)
     _, actual_output, _, final_state, *_ = chunk_module.chunk_gated_delta_rule_fwd(
@@ -137,4 +145,5 @@ def test_gdn_prefill_pipeline_wires_every_scratch_output(monkeypatch) -> None:
         "final_state",
     }
     assert all(tensor is not None for tensor in seen.values())
+    assert prep_ptrs.isdisjoint(tensor.data_ptr() for tensor in seen.values())
     reset_workspace_manager()
