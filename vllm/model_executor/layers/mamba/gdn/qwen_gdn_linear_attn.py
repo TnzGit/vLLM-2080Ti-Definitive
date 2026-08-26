@@ -1600,6 +1600,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out_decode = None
 
         # 2.3: Process the remaining part (prefill chunk, or non-spec decode-only)
+        prefill_output_inplace = False
         if attn_metadata.num_prefills > 0:
             # State indices, initial-state mask and cu_seqlens for the chunk
             # kernel are precomputed by the metadata builder (the prefill tail
@@ -1611,6 +1612,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert prefill_has_initial_state is not None
             initial_state = ssm_state[prefill_state_indices]
             initial_state[~prefill_has_initial_state, ...] = 0
+
+            # The FLA chunk kernel can write directly into the output buffer
+            # supplied by the model runner.  Pure prefill is contiguous in the
+            # runner output, so reusing that buffer avoids one variable-sized
+            # allocation per GDN layer.  This is especially important for a
+            # long-lived server handling differently sized continuation
+            # prefills: repeatedly allocating ``empty_like(v)`` fragments the
+            # CUDA caching allocator even when total reserved memory is ample.
+            #
+            # Speculative and mixed prefill/decode batches have gathered or
+            # stitched output layouts; keep their existing temporary-output
+            # path until they have a dedicated safe workspace mapping.
+            prefill_core_attn_out = None
+            if spec_sequence_masks is None and not split_non_spec:
+                prefill_core_attn_out = core_attn_out[:num_actual_tokens]
+                prefill_output_inplace = True
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -1626,6 +1643,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_indices=attn_metadata.chunk_indices,
                 chunk_offsets=attn_metadata.chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
+                core_attn_out=prefill_core_attn_out,
             )
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
@@ -1672,6 +1690,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+        elif prefill_output_inplace:
+            # The chunk kernel already populated this exact slice.
+            pass
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
