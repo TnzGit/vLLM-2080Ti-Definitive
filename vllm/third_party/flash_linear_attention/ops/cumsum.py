@@ -165,6 +165,7 @@ def chunk_local_cumsum_scalar(
     chunk_indices: torch.Tensor | None = None,
     head_first: bool = False,
     output_dtype: torch.dtype | None = torch.float,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if head_first:
         B, H, T = g.shape
@@ -177,7 +178,15 @@ def chunk_local_cumsum_scalar(
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     BT = chunk_size
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
+    g_org = g
+    expected_dtype = output_dtype or g.dtype
+    if out is None:
+        g = torch.empty_like(g, dtype=expected_dtype)
+    else:
+        assert out.shape == g.shape
+        assert out.dtype == expected_dtype
+        assert out.device == g.device
+        g = out
     grid = (NT, B * H)
     chunk_local_cumsum_scalar_kernel[grid](
         g_org,
@@ -202,6 +211,7 @@ def chunk_local_cumsum_vector(
     chunk_indices: torch.Tensor | None = None,
     head_first: bool = False,
     output_dtype: torch.dtype | None = torch.float,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if head_first:
         B, H, T, S = g.shape
@@ -215,7 +225,15 @@ def chunk_local_cumsum_vector(
     BT = chunk_size
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
+    g_org = g
+    expected_dtype = output_dtype or g.dtype
+    if out is None:
+        g = torch.empty_like(g, dtype=expected_dtype)
+    else:
+        assert out.shape == g.shape
+        assert out.dtype == expected_dtype
+        assert out.device == g.device
+        g = out
 
     def grid(meta):
         return (triton.cdiv(meta["S"], meta["BS"]), NT, B * H)
@@ -248,6 +266,7 @@ def chunk_local_cumsum(
     chunk_indices: torch.Tensor | None = None,
     head_first: bool = False,
     output_dtype: torch.dtype | None = torch.float,
+    out: torch.Tensor | None = None,
     **kwargs,
 ) -> torch.Tensor:
     if cu_seqlens is not None:
@@ -263,6 +282,7 @@ def chunk_local_cumsum(
             chunk_indices,
             head_first,
             output_dtype,
+            out,
         )
     elif len(g.shape) == 4:
         return chunk_local_cumsum_vector(
@@ -273,6 +293,7 @@ def chunk_local_cumsum(
             chunk_indices,
             head_first,
             output_dtype,
+            out,
         )
     else:
         raise ValueError(

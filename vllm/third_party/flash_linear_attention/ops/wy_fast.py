@@ -124,6 +124,8 @@ def recompute_w_u_fwd(
     A: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
     chunk_indices: torch.Tensor | None = None,
+    w_out: torch.Tensor | None = None,
+    u_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, v.shape[-1]
     H = v.shape[-2]
@@ -134,8 +136,21 @@ def recompute_w_u_fwd(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK = 64
     BV = 64
-    u = torch.empty_like(v)
-    w = k.new_empty(B, T, H, K)
+    expected_w_shape = (B, T, H, K)
+    if u_out is None:
+        u = torch.empty_like(v)
+    else:
+        assert u_out.shape == v.shape
+        assert u_out.dtype == v.dtype
+        assert u_out.device == v.device
+        u = u_out
+    if w_out is None:
+        w = k.new_empty(expected_w_shape)
+    else:
+        assert w_out.shape == expected_w_shape
+        assert w_out.dtype == k.dtype
+        assert w_out.device == k.device
+        w = w_out
     recompute_w_u_fwd_kernel[(NT, B * H)](
         k=k,
         v=v,

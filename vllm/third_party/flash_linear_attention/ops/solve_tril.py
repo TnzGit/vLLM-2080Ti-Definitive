@@ -509,6 +509,7 @@ def solve_tril(
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     output_dtype: torch.dtype = torch.float,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Compute the inverse of the matrix I + A
@@ -536,7 +537,14 @@ def solve_tril(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
 
-    Ai = torch.zeros_like(A, dtype=output_dtype)
+    if out is None:
+        Ai = torch.zeros_like(A, dtype=output_dtype)
+    else:
+        assert out.shape == A.shape
+        assert out.dtype == output_dtype
+        assert out.device == A.device
+        Ai = out
+        Ai.zero_()
     if BT == 16:
         merge_fn = solve_tril_16x16_kernel
     elif BT == 32:

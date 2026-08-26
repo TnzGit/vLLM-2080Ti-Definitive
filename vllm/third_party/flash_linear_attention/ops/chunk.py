@@ -8,6 +8,8 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
+from math import prod
+
 import torch
 
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
@@ -18,6 +20,139 @@ from .l2norm import l2norm_fwd
 from .solve_tril import solve_tril
 from .utils import FLA_CHUNK_SIZE, SUPPRESS_LEVEL, input_guard
 from .wy_fast import recompute_w_u_fwd
+
+
+def _workspace_manager():
+    # Keep the bundled FLA module importable outside the V1 worker.  Importing
+    # WorkspaceManager eagerly here creates a model-loader/worker import cycle.
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        is_workspace_manager_initialized,
+    )
+
+    if not is_workspace_manager_initialized():
+        return None
+    return current_workspace_manager()
+
+
+def _gdn_prefill_workspace_specs(
+    *,
+    batch_size: int,
+    num_tokens: int,
+    num_heads: int,
+    key_dim: int,
+    value_dim: int,
+    dtype: torch.dtype,
+    num_chunks: int,
+    num_sequences: int,
+) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+    """Return every simultaneously-live FLA prefill scratch allocation.
+
+    Keeping this list in one place is important: WorkspaceManager can reserve
+    the complete peak before CUDA graph locking and serve compact typed views
+    at inference time.  No tensor in this list escapes the GDN prefill call.
+    """
+    bt = FLA_CHUNK_SIZE
+    return (
+        ((batch_size, num_tokens, num_heads), torch.float32),  # cumulative g
+        ((batch_size, num_tokens, num_heads, bt), torch.float32),  # raw A
+        ((batch_size, num_tokens, num_heads, bt), dtype),  # solved A
+        ((batch_size, num_tokens, num_heads, key_dim), dtype),  # w
+        ((batch_size, num_tokens, num_heads, value_dim), dtype),  # u
+        (
+            (batch_size, num_chunks, num_heads, value_dim, key_dim),
+            dtype,
+        ),  # h
+        ((batch_size, num_tokens, num_heads, value_dim), dtype),  # v_new
+        ((num_sequences, num_heads, value_dim, key_dim), torch.float32),
+    )
+
+
+def reserve_gdn_prefill_workspace(
+    *,
+    max_num_batched_tokens: int,
+    max_num_sequences: int,
+    num_heads: int,
+    key_dim: int,
+    value_dim: int,
+    dtype: torch.dtype,
+) -> int:
+    """Reserve the worst-case flattened varlen GDN prefill workspace.
+
+    A flattened batch can need one partial chunk per sequence.  The extra
+    ``max_num_sequences - 1`` chunks make the reservation safe even when the
+    scheduler splits the token budget across many short requests.
+    """
+    manager = _workspace_manager()
+    if manager is None:
+        return 0
+    num_chunks = (
+        (max_num_batched_tokens + FLA_CHUNK_SIZE - 1) // FLA_CHUNK_SIZE
+        + max(0, max_num_sequences - 1)
+    )
+    specs = _gdn_prefill_workspace_specs(
+        batch_size=1,
+        num_tokens=max_num_batched_tokens,
+        num_heads=num_heads,
+        key_dim=key_dim,
+        value_dim=value_dim,
+        dtype=dtype,
+        num_chunks=num_chunks,
+        num_sequences=max_num_sequences,
+    )
+    manager.get_simultaneous(*specs)
+    return sum(prod(shape) * dt.itemsize for shape, dt in specs)
+
+
+def _get_gdn_prefill_workspace(
+    *,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    output_final_state: bool,
+    cu_seqlens: torch.Tensor | None,
+    chunk_indices: torch.Tensor | None,
+) -> list[torch.Tensor] | None:
+    manager = _workspace_manager()
+    if manager is None:
+        return None
+    B, T, _Hg, K = k.shape
+    H = beta.shape[-1]
+    V = v.shape[-1]
+    if cu_seqlens is None:
+        num_sequences = B
+        num_chunks = (T + FLA_CHUNK_SIZE - 1) // FLA_CHUNK_SIZE
+    else:
+        num_sequences = len(cu_seqlens) - 1
+        if chunk_indices is not None:
+            num_chunks = len(chunk_indices)
+        else:
+            # prepare_chunk_indices uses one ceil-divided chunk group per seq.
+            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            num_chunks = int(
+                torch.div(
+                    lengths + FLA_CHUNK_SIZE - 1,
+                    FLA_CHUNK_SIZE,
+                    rounding_mode="floor",
+                )
+                .sum()
+                .item()
+            )
+    specs = list(
+        _gdn_prefill_workspace_specs(
+            batch_size=B,
+            num_tokens=T,
+            num_heads=H,
+            key_dim=K,
+            value_dim=V,
+            dtype=k.dtype,
+            num_chunks=num_chunks,
+            num_sequences=num_sequences,
+        )
+    )
+    if not output_final_state:
+        specs.pop()
+    return manager.get_simultaneous(*specs)
 
 
 def chunk_gated_delta_rule_fwd(
@@ -34,8 +169,30 @@ def chunk_gated_delta_rule_fwd(
     chunk_offsets: torch.Tensor | None = None,
     core_attn_out: torch.Tensor | None = None,
 ):
+    # This bundled FLA implementation is inference-only.  Use the shared
+    # workspace for every inference layout, including speculative/mixed
+    # batches whose final output cannot yet alias the model-runner buffer.
+    scratch = _get_gdn_prefill_workspace(
+        k=k,
+        v=v,
+        beta=beta,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
+    if scratch is None:
+        g_out = A_out = Ai_out = w_out = u_out = h_out = v_new_out = None
+        final_state_out = None
+    else:
+        g_out, A_out, Ai_out, w_out, u_out, h_out, v_new_out, *rest = scratch
+        final_state_out = rest[0] if rest else None
+
     g = chunk_local_cumsum(
-        g, chunk_size=FLA_CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
+        g,
+        chunk_size=FLA_CHUNK_SIZE,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        out=g_out,
     )
     # obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
@@ -45,9 +202,14 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         output_dtype=torch.float32,
+        out=A_out,
     )
     A = solve_tril(
-        A=A, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, output_dtype=k.dtype
+        A=A,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        output_dtype=k.dtype,
+        out=Ai_out,
     )
     w, u = recompute_w_u_fwd(
         k=k,
@@ -57,6 +219,8 @@ def chunk_gated_delta_rule_fwd(
         g_cumsum=g,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        w_out=w_out,
+        u_out=u_out,
     )
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=k,
@@ -68,6 +232,9 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
+        h_out=h_out,
+        v_new_out=v_new_out,
+        final_state_out=final_state_out,
     )
     o = chunk_fwd_o(
         q=q,
