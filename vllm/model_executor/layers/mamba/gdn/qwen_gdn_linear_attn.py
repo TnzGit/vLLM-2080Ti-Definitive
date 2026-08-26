@@ -741,6 +741,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
         self._prefill_kernels_warmed_up = False
+        self._gdn_workspace_max_num_batched_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        self._gdn_workspace_max_num_sequences = (
+            vllm_config.scheduler_config.max_num_seqs
+        )
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
         )
@@ -1283,12 +1289,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_v_heads = self.num_v_heads // self.tp_size
         _, state_dtype = self.get_state_dtype()
 
-        vllm_config = get_current_vllm_config()
         reserved_bytes = reserve_gdn_prefill_workspace(
-            max_num_batched_tokens=(
-                vllm_config.scheduler_config.max_num_batched_tokens
-            ),
-            max_num_sequences=vllm_config.scheduler_config.max_num_seqs,
+            max_num_batched_tokens=self._gdn_workspace_max_num_batched_tokens,
+            max_num_sequences=self._gdn_workspace_max_num_sequences,
             num_heads=num_v_heads,
             key_dim=self.head_k_dim,
             value_dim=self.head_v_dim,
@@ -1298,7 +1301,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             "Reserved %.2f MiB of shared GDN prefill scratch for up to "
             "%d batched tokens.",
             reserved_bytes / (1024**2),
-            vllm_config.scheduler_config.max_num_batched_tokens,
+            self._gdn_workspace_max_num_batched_tokens,
         )
 
         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
