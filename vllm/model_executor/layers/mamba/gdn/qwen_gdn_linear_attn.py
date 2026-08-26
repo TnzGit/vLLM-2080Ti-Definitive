@@ -57,7 +57,10 @@ from vllm.third_party.flash_linear_attention.ops import (
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_sigmoid_gating_delta_rule_update,
 )
-from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
+from vllm.third_party.flash_linear_attention.ops.chunk import (
+    l2norm_fwd,
+    reserve_gdn_prefill_workspace,
+)
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 from vllm.triton_utils import tl, triton
@@ -1193,6 +1196,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_k_heads = self.num_k_heads // self.tp_size
         num_v_heads = self.num_v_heads // self.tp_size
         _, state_dtype = self.get_state_dtype()
+
+        vllm_config = get_current_vllm_config()
+        reserved_bytes = reserve_gdn_prefill_workspace(
+            max_num_batched_tokens=(
+                vllm_config.scheduler_config.max_num_batched_tokens
+            ),
+            max_num_sequences=vllm_config.scheduler_config.max_num_seqs,
+            num_heads=num_v_heads,
+            key_dim=self.head_k_dim,
+            value_dim=self.head_v_dim,
+            dtype=dtype,
+        )
+        logger.info_once(
+            "Reserved %.2f MiB of shared GDN prefill scratch for up to "
+            "%d batched tokens.",
+            reserved_bytes / (1024**2),
+            vllm_config.scheduler_config.max_num_batched_tokens,
+        )
 
         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
         # is sufficient to populate every autotuner cache. Mirror the real

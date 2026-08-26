@@ -331,6 +331,9 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_indices: torch.Tensor | None = None,
     chunk_offsets: torch.Tensor | None = None,
     use_exp2: bool = False,
+    h_out: torch.Tensor | None = None,
+    v_new_out: torch.Tensor | None = None,
+    final_state_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # This kernel is slightly different from fla to support Q/K with different head numbers.
     # In fla, Q/K always have the same head number, so Hg is always equal to H.
@@ -349,12 +352,36 @@ def chunk_gated_delta_rule_fwd_h(
             chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    h = k.new_empty(B, NT, H, V, K)
-    final_state = (
-        k.new_empty(N, H, V, K, dtype=torch.float32) if output_final_state else None
-    )
+    expected_h_shape = (B, NT, H, V, K)
+    if h_out is None:
+        h = k.new_empty(expected_h_shape)
+    else:
+        assert h_out.shape == expected_h_shape
+        assert h_out.dtype == k.dtype
+        assert h_out.device == k.device
+        h = h_out
+    if output_final_state:
+        expected_final_shape = (N, H, V, K)
+        if final_state_out is None:
+            final_state = k.new_empty(expected_final_shape, dtype=torch.float32)
+        else:
+            assert final_state_out.shape == expected_final_shape
+            assert final_state_out.dtype == torch.float32
+            assert final_state_out.device == k.device
+            final_state = final_state_out
+    else:
+        final_state = None
 
-    v_new = torch.empty_like(u) if save_new_value else None
+    if save_new_value:
+        if v_new_out is None:
+            v_new = torch.empty_like(u)
+        else:
+            assert v_new_out.shape == u.shape
+            assert v_new_out.dtype == u.dtype
+            assert v_new_out.device == u.device
+            v_new = v_new_out
+    else:
+        v_new = None
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
