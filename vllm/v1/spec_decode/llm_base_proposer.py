@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
 from vllm.config import (
     CUDAGraphMode,
@@ -317,6 +318,23 @@ class SpecDecodeBaseProposer:
 
             self.allowed_attn_types = tuple(rocm_types)
 
+    def _sm75_mtp_forward_barrier(
+        self, label: str, cudagraph_runtime_mode: CUDAGraphMode
+    ) -> None:
+        """Retire an SM75 MTP forward before its persistent inputs are reused."""
+        if (
+            envs.VLLM_SM75_SPEC_SYNC_MODE != "safe"
+            or self.method != "mtp"
+            or cudagraph_runtime_mode == CUDAGraphMode.NONE
+        ):
+            return
+        logger.info_once("SM75 MTP forward barrier enabled: %s", label)
+        try:
+            torch.cuda.synchronize(self.device)
+        except Exception:
+            logger.exception("SM75 MTP forward barrier failed: %s", label)
+            raise
+
     def _raise_if_padded_drafter_batch_disabled(self):
         if self.speculative_config.disable_padded_drafter_batch:
             raise NotImplementedError(
@@ -594,6 +612,8 @@ class SpecDecodeBaseProposer:
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
 
+        self._sm75_mtp_forward_barrier("first-forward", cudagraph_runtime_mode)
+
         # After step 0: switch to reuse mode so steps 1+ skip the indexer
         # and read the indices that step 0 just wrote into the shared buffer.
         if self._share_mtp_indices and hasattr(self.model.model, "set_skip_topk"):
@@ -750,6 +770,10 @@ class SpecDecodeBaseProposer:
                     hidden_states = ret_hidden_states
                 else:
                     last_hidden_states, hidden_states = ret_hidden_states
+
+            self._sm75_mtp_forward_barrier(
+                f"step-{token_index + 1}-forward", cudagraph_runtime_mode
+            )
 
             hidden_states = hidden_states[:batch_size]
             draft_token_ids, draft_probs = self._sample_draft_tokens(
