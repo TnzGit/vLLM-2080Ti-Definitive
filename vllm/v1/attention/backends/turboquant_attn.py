@@ -16,10 +16,10 @@ Per-head per-position slot layout:
   For turboquant_k3v4_nc head_dim=256: [100 bytes key | 512 bytes value] = 612
 """
 
-from collections import OrderedDict
 import functools
 import math
 import os
+from collections import OrderedDict
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any, ClassVar
@@ -55,6 +55,10 @@ from vllm.v1.attention.backends.fa_utils import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+from vllm.v1.attention.ops.turboquant_workspace import (
+    continuation_prefill_reservation_specs,
+    continuation_prefill_workspace_specs,
+)
 from vllm.v1.attention.ops.triton_turboquant_decode import (
     _tq_full_dequant_kv,
     _fp8_format_code,
@@ -159,11 +163,15 @@ _TQ_FI_PREFILL_PLAN_CACHE_MAXSIZE = max(
     1,
     int(
         os.getenv(
-            "VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE_MAXSIZE",
-            "16",
+            "VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE_MAX_ENTRIES",
+            os.getenv(
+                "VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE_MAXSIZE", "16"
+            ),
         )
     ),
 )
+# Keep the post-pre2 name as an alias for production-state compatibility.
+_TQ_FI_PLAN_CACHE_MAX_ENTRIES = _TQ_FI_PREFILL_PLAN_CACHE_MAXSIZE
 _TQ_FI_PREFILL_CUDAGRAPH_SAFE = (
     os.getenv("VLLM_TURBOQUANT_FLASHINFER_PREFILL_CUDAGRAPH_SAFE", "0") == "1"
 )
@@ -204,6 +212,17 @@ def _prepare_tq_flashinfer_prefill_wrapper_cache(cache_key: tuple[Any, ...]):
         # maxsize + 1 workspaces and can defeat the OOM protection.
         _TQ_FI_PREFILL_WRAPPERS.popitem(last=False)
     return None
+
+
+def _cache_tq_flashinfer_wrapper(cache_key: tuple[Any, ...], wrapper: Any) -> None:
+    """Bound shape-specialized FlashInfer plans to avoid long-run GPU growth."""
+    _TQ_FI_PREFILL_WRAPPERS[cache_key] = wrapper
+    _TQ_FI_PREFILL_WRAPPERS.move_to_end(cache_key)
+    while (
+        not _TQ_FI_PREFILL_CUDAGRAPH_SAFE
+        and len(_TQ_FI_PREFILL_WRAPPERS) > _TQ_FI_PREFILL_PLAN_CACHE_MAXSIZE
+    ):
+        _TQ_FI_PREFILL_WRAPPERS.popitem(last=False)
 
 
 def _build_hadamard(d: int, device_str: str) -> torch.Tensor:
@@ -295,7 +314,7 @@ def _get_or_plan_tq_flashinfer_prefill_wrapper(
             **wrapper_kwargs,
         )
         wrapper.plan(**plan_kwargs)
-        _TQ_FI_PREFILL_WRAPPERS[cache_key] = wrapper
+        _cache_tq_flashinfer_wrapper(cache_key, wrapper)
     return wrapper
 
 
@@ -726,13 +745,23 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         if not reserve_continuation_prefill:
             return
 
-        max_cached_len = max(0, model_config.max_model_len - 1)
-        alloc_len = round_up(max_cached_len, self.kv_cache_spec.block_size)
-        cache_buf_shape = (1, num_kv_heads, alloc_len, head_size)
-        current_workspace_manager().get_simultaneous(
-            (cache_buf_shape, torch.float16),
-            (cache_buf_shape, torch.float16),
+        from vllm.model_executor.layers.quantization.turboquant.config import (
+            TurboQuantConfig,
         )
+
+        cache_dtype = self.vllm_config.cache_config.cache_dtype
+        tq_config = TurboQuantConfig.from_cache_dtype(cache_dtype, head_size)
+        alloc_len = round_up(model_config.max_model_len, self.kv_cache_spec.block_size)
+        specs = continuation_prefill_reservation_specs(
+            alloc_len=alloc_len,
+            max_query_len=scheduler_config.max_num_batched_tokens,
+            num_q_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_size,
+            activation_dtype=model_config.dtype,
+            key_fp8=tq_config.key_fp8,
+        )
+        current_workspace_manager().get_simultaneous(*specs.values())
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -939,7 +968,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 **wrapper_kwargs,
             )
             wrapper.plan(**plan_kwargs)
-            _TQ_FI_PREFILL_WRAPPERS[cache_key] = wrapper
+            _cache_tq_flashinfer_wrapper(cache_key, wrapper)
         return wrapper
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
@@ -1759,24 +1788,37 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         mse_bytes = self._mse_bytes
         val_data_bytes = self._val_data_bytes
 
-        # Dequant cached K/V from TQ cache
-        # Allocate slightly over to align to block_size for the grid.
-        # Reuse cached buffers to avoid per-call allocation (~16MB at 8K).
-        alloc_len = math.ceil(cached_len / block_size) * block_size
-        buf_shape = (1, Hk, alloc_len, D)
-        # Use WorkspaceManager for dequant buffers.
-        # Shared across all layers — saves 60× memory at long context.
-        # Required for CUDA Graph capture (per-layer growth incompatible with CG).
-        k_buf, v_buf = current_workspace_manager().get_simultaneous(
-            (buf_shape, torch.float16),
-            (buf_shape, torch.float16),
+        # Acquire every tensor that will be simultaneously live from one fixed
+        # backing allocation.  A second get_simultaneous() call can overlap the
+        # first call's views, so this must stay a single call.
+        prefix_combine = flashinfer_prefix_combine_wrappers is not None
+        dequant_alloc_len = round_up(cached_len, block_size)
+        workspace_alloc_len = round_up(seq_len, block_size)
+        specs = continuation_prefill_workspace_specs(
+            alloc_len=workspace_alloc_len,
+            max_query_len=q_len,
+            num_q_heads=Hq,
+            num_kv_heads=Hk,
+            head_dim=D,
+            activation_dtype=query.dtype,
+            key_fp8=self.tq_config.key_fp8,
+            prefix_combine=prefix_combine,
         )
-        # Skip .zero_() — kernel writes all positions up to cached_len,
-        # and we only read [:cached_len] afterwards.
-        k_cached = k_buf[:, :, :alloc_len, :]
-        v_cached = v_buf[:, :, :alloc_len, :]
+        buffers = dict(
+            zip(
+                specs,
+                current_workspace_manager().get_simultaneous(*specs.values()),
+                strict=True,
+            )
+        )
+        k_dequant = buffers["k_dequant"]
+        v_dequant = buffers["v_dequant"]
+        # The dequant kernel expects BHND strides; these are zero-copy views of
+        # the final NHD workspace buffers on the FP16 K8V4 production route.
+        k_cached = k_dequant[:dequant_alloc_len].transpose(0, 1).unsqueeze(0)
+        v_cached = v_dequant[:dequant_alloc_len].transpose(0, 1).unsqueeze(0)
 
-        grid = (alloc_len, 1 * Hk)
+        grid = (dequant_alloc_len, 1 * Hk)
         _tq_full_dequant_kv[grid](
             kv_cache,
             block_table,
@@ -1808,29 +1850,36 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             num_warps=4,
         )
 
-        # Inverse-rotate MSE keys back to original space
+        # Inverse-rotate MSE keys back to original space.  torch.mm(out=...)
+        # prevents the former per-request GEMM result allocation.
         if not self.tq_config.key_fp8:
-            # fp16 matmul for rotation (2× less bandwidth, uses fp16 tensor cores)
             Pi_half = layer._tq_Pi_half
-            k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D)
-            k_flat = k_flat @ Pi_half
-            k_cached_trim = k_flat.reshape(Hk, cached_len, D).transpose(
-                0, 1
-            )  # (cached_len, Hk, D) — already fp16
+            k_rotated = buffers["k_rotated"]
+            torch.mm(
+                k_dequant[:cached_len].reshape(-1, D),
+                Pi_half,
+                out=k_rotated[:cached_len].reshape(-1, D),
+            )
+            k_source = k_rotated
         else:
-            k_cached_trim = k_cached[0, :, :cached_len, :].transpose(
-                0, 1
-            )  # (cached_len, Hk, D)
+            k_source = k_dequant
 
-        # Skip .contiguous() — the copy into k_full/v_full handles layout
-        v_cached_trim = v_cached[0, :, :cached_len, :].transpose(0, 1)
+        if query.dtype == torch.float16:
+            k_full = k_source
+            v_full = v_dequant
+        else:
+            k_full = buffers["k_full"]
+            v_full = buffers["v_full"]
+            k_full[:cached_len].copy_(k_source[:cached_len])
+            v_full[:cached_len].copy_(v_dequant[:cached_len])
+
+        k_cached_trim = k_full[:cached_len]
+        v_cached_trim = v_full[:cached_len]
 
         if flashinfer_prefix_combine_wrappers is not None:
             prefix_wrapper, current_wrapper = flashinfer_prefix_combine_wrappers
-            prefix_out = torch.empty_like(query)
-            prefix_lse = torch.empty(
-                (q_len, Hq), dtype=torch.float32, device=device
-            )
+            prefix_out = buffers["prefix_out"]
+            prefix_lse = buffers["prefix_lse"]
             prefix_out, prefix_lse = prefix_wrapper.run(
                 query,
                 k_cached_trim,
@@ -1839,10 +1888,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 lse=prefix_lse,
                 return_lse=True,
             )
-            current_out = torch.empty_like(query)
-            current_lse = torch.empty(
-                (q_len, Hq), dtype=torch.float32, device=device
-            )
+            current_out = buffers["current_out"]
+            current_lse = buffers["current_lse"]
             current_out, current_lse = current_wrapper.run(
                 query,
                 key_chunk,
@@ -1851,13 +1898,17 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 lse=current_lse,
                 return_lse=True,
             )
-            merged_out = torch.empty_like(query)
+            merged_out = buffers["merged_out"]
+            prefix_lse_hq = buffers["prefix_lse_hq"]
+            current_lse_hq = buffers["current_lse_hq"]
+            prefix_lse_hq.copy_(prefix_lse.transpose(0, 1))
+            current_lse_hq.copy_(current_lse.transpose(0, 1))
             merge_attn_states(
                 merged_out,
                 prefix_out,
-                prefix_lse.transpose(0, 1).contiguous(),
+                prefix_lse_hq,
                 current_out,
-                current_lse.transpose(0, 1).contiguous(),
+                current_lse_hq,
             )
             logger.info_once(
                 "TurboQuant continuation prefix-combine path used: "
@@ -1870,18 +1921,17 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
             return merged_out
 
-        # Concatenate cached + current chunk K/V (match query dtype)
-        # Pre-allocate full K/V buffer, copy into slices (no cat alloc)
-        qdtype = query.dtype
-        k_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
-        v_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
-        k_full[:cached_len] = k_cached_trim.to(qdtype)
-        k_full[cached_len:] = key_chunk
-        v_full[:cached_len] = v_cached_trim.to(qdtype)
-        v_full[cached_len:] = val_chunk
+        # Append current raw K/V into the fixed full-context buffers.
+        k_full[cached_len:seq_len].copy_(key_chunk)
+        v_full[cached_len:seq_len].copy_(val_chunk)
+        k_full_trim = k_full[:seq_len]
+        v_full_trim = v_full[:seq_len]
 
         if flashinfer_wrapper is not None:
-            return flashinfer_wrapper.run(query, k_full, v_full)
+            attn_out = buffers["attn_out"]
+            return flashinfer_wrapper.run(
+                query, k_full_trim, v_full_trim, out=attn_out
+            )
 
         # Attention: q_len queries attending to seq_len K/V with causal mask
         if _HAS_FLASH_ATTN:
@@ -1896,8 +1946,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             cu_seqlens_k = self._cu_2_k
             return self._flash_attn_varlen(
                 q=query,
-                k=k_full,
-                v=v_full,
+                k=k_full_trim,
+                v=v_full_trim,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=q_len,
@@ -1906,8 +1956,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         else:
             # SDPA fallback: expand KV for GQA, build causal mask
             q_t = query.transpose(0, 1).unsqueeze(0)  # (1, Hq, q_len, D)
-            k_t = k_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            v_t = v_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
+            k_t = k_full_trim.transpose(0, 1).unsqueeze(0)
+            v_t = v_full_trim.transpose(0, 1).unsqueeze(0)
             # Build causal mask: query position p can attend to K position j
             # where j <= cached_len + p (p is 0-indexed within chunk)
             q_pos = torch.arange(q_len, device=device).unsqueeze(1) + cached_len

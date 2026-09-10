@@ -66,6 +66,50 @@ from vllm.v1.request import Request
 pytestmark = pytest.mark.cpu_test
 
 
+def test_turboquant_prefill_workspace_budget_matches_runtime_specs(monkeypatch):
+    from vllm.v1.attention.ops.turboquant_workspace import (
+        continuation_prefill_reservation_specs,
+        workspace_specs_bytes,
+    )
+
+    monkeypatch.setattr(
+        kv_cache_utils.envs, "VLLM_TQ_RESERVE_PREFILL_WORKSPACE", True
+    )
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            cache_dtype="turboquant_k8v4",
+            block_size=32,
+        ),
+        scheduler_config=SimpleNamespace(
+            enable_chunked_prefill=True,
+            max_num_batched_tokens=2560,
+        ),
+        model_config=SimpleNamespace(
+            max_model_len=131072,
+            dtype=torch.float16,
+            get_num_attention_heads=lambda parallel_config: 16,
+            get_num_kv_heads=lambda parallel_config: 4,
+            get_head_size=lambda: 128,
+        ),
+        parallel_config=SimpleNamespace(enable_dbo=False),
+    )
+    expected = workspace_specs_bytes(
+        continuation_prefill_reservation_specs(
+            alloc_len=131072,
+            max_query_len=2560,
+            num_q_heads=16,
+            num_kv_heads=4,
+            head_dim=128,
+            activation_dtype=torch.float16,
+            key_fp8=True,
+        )
+    )
+
+    assert kv_cache_utils._turboquant_prefill_workspace_reserve_bytes(config) == (
+        expected
+    )
+
+
 @pytest.fixture(autouse=True)
 def _auto_init_hash_fn(request):
     hash_fn: Callable

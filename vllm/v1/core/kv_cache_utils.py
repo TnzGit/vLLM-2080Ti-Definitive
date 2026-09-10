@@ -2095,7 +2095,7 @@ _TQ_CONTINUATION_DECODE_THRESHOLD = 128
 
 
 def _turboquant_prefill_workspace_reserve_bytes(vllm_config: VllmConfig) -> int:
-    """Reserve the TurboQuant continuation-prefill dequant workspace."""
+    """Reserve every live TurboQuant continuation-prefill workspace view."""
     if not envs.VLLM_TQ_RESERVE_PREFILL_WORKSPACE:
         return 0
     cache_config = vllm_config.cache_config
@@ -2112,14 +2112,33 @@ def _turboquant_prefill_workspace_reserve_bytes(vllm_config: VllmConfig) -> int:
 
     model_config = vllm_config.model_config
     parallel_config = vllm_config.parallel_config
+    num_q_heads = model_config.get_num_attention_heads(parallel_config)
     num_kv_heads = model_config.get_num_kv_heads(parallel_config)
     head_size = model_config.get_head_size()
-    max_cached_len = max(0, model_config.max_model_len - 1)
     block_size = int(cache_config.block_size)
-    alloc_len = round_up(max_cached_len, block_size)
-    buf_bytes = round_up(num_kv_heads * alloc_len * head_size * 2, 256)
+    alloc_len = round_up(model_config.max_model_len, block_size)
+
+    from vllm.model_executor.layers.quantization.turboquant.config import (
+        TurboQuantConfig,
+    )
+    from vllm.v1.attention.ops.turboquant_workspace import (
+        continuation_prefill_reservation_specs,
+        workspace_specs_bytes,
+    )
+
+    tq_config = TurboQuantConfig.from_cache_dtype(cache_dtype, head_size)
+    specs = continuation_prefill_reservation_specs(
+        alloc_len=alloc_len,
+        max_query_len=scheduler_config.max_num_batched_tokens,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_size,
+        activation_dtype=model_config.dtype,
+        key_fp8=tq_config.key_fp8,
+    )
+    workspace_bytes = workspace_specs_bytes(specs)
     num_ubatches = 2 if getattr(parallel_config, "enable_dbo", False) else 1
-    return 2 * buf_bytes * num_ubatches
+    return workspace_bytes * num_ubatches
 
 
 def get_kv_cache_configs(

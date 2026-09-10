@@ -312,6 +312,7 @@ class TestTurboQuantWorkspaceReservation:
         max_num_kv_splits: int = 4,
     ):
         return SimpleNamespace(
+            cache_config=SimpleNamespace(cache_dtype="turboquant_k8v4"),
             scheduler_config=SimpleNamespace(
                 max_num_seqs=max_num_seqs,
                 max_num_batched_tokens=max_num_batched_tokens,
@@ -380,10 +381,91 @@ class TestTurboQuantWorkspaceReservation:
                 ((16, 8), torch.float32),
             ),
             (
-                ((1, 4, 8192, 128), torch.float16),
-                ((1, 4, 8192, 128), torch.float16),
+                ((8192, 4, 128), torch.float16),
+                ((8192, 4, 128), torch.float16),
+                ((4096, 8, 128), torch.float16),
+                ((4096, 8, 128), torch.float16),
+                ((4096, 8, 128), torch.float16),
+                ((4096, 8), torch.float32),
+                ((4096, 8), torch.float32),
+                ((8, 4096), torch.float32),
+                ((8, 4096), torch.float32),
             ),
         ]
+
+    def test_continuation_workspace_specs_cover_all_live_flashinfer_outputs(self):
+        from vllm.v1.attention.ops.turboquant_workspace import (
+            continuation_prefill_reservation_specs,
+            continuation_prefill_workspace_specs,
+            workspace_specs_bytes,
+        )
+
+        kwargs = dict(
+            alloc_len=131072,
+            max_query_len=2560,
+            num_q_heads=16,
+            num_kv_heads=4,
+            head_dim=128,
+            activation_dtype=torch.float16,
+            key_fp8=True,
+        )
+        standard = continuation_prefill_workspace_specs(
+            **kwargs, prefix_combine=False
+        )
+        combined = continuation_prefill_workspace_specs(
+            **kwargs, prefix_combine=True
+        )
+        reserved = continuation_prefill_reservation_specs(**kwargs)
+
+        assert tuple(standard) == ("k_dequant", "v_dequant", "attn_out")
+        assert tuple(combined) == (
+            "k_dequant",
+            "v_dequant",
+            "prefix_out",
+            "current_out",
+            "merged_out",
+            "prefix_lse",
+            "current_lse",
+            "prefix_lse_hq",
+            "current_lse_hq",
+        )
+        assert reserved == combined
+        assert workspace_specs_bytes(reserved) >= workspace_specs_bytes(standard)
+
+    @pytest.mark.parametrize(
+        ("key_fp8", "dtype", "expected_extra"),
+        [
+            (True, torch.float16, set()),
+            (False, torch.float16, {"k_rotated"}),
+            (True, torch.bfloat16, {"k_full", "v_full"}),
+            (
+                False,
+                torch.bfloat16,
+                {"k_rotated", "k_full", "v_full"},
+            ),
+        ],
+    )
+    def test_continuation_workspace_conversion_buffers_are_config_aware(
+        self, key_fp8, dtype, expected_extra
+    ):
+        from vllm.v1.attention.ops.turboquant_workspace import (
+            continuation_prefill_workspace_specs,
+        )
+
+        specs = continuation_prefill_workspace_specs(
+            alloc_len=1024,
+            max_query_len=128,
+            num_q_heads=8,
+            num_kv_heads=4,
+            head_dim=128,
+            activation_dtype=dtype,
+            key_fp8=key_fp8,
+            prefix_combine=False,
+        )
+        assert (
+            set(specs) - {"k_dequant", "v_dequant", "attn_out"}
+            == expected_extra
+        )
 
     def test_metadata_builder_skips_continuation_prefill_when_disabled(
         self, monkeypatch

@@ -108,11 +108,20 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                 i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
             else:
                 i_t = 0
-            # Load state index and check for invalid entries
-            state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
-                tl.int64
-            )
+            # An accepted count of zero, or a stale/oversized count, must not
+            # select outside this request's row and turn adjacent memory into
+            # a recurrent-state address.
+            idx_in_row = (i_t >= 0) & (i_t < stride_indices_seq)
+            state_idx = tl.load(
+                ssm_state_indices + i_n * stride_indices_seq + i_t,
+                mask=idx_in_row,
+                other=-1,
+            ).to(tl.int64)
             if state_idx < 0 or state_idx == null_block_id:
+                zero = tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty)
+                for _ in range(0, T):
+                    tl.store(p_o, zero, mask=mask_v)
+                    p_o += HV * V
                 return
             p_h0 = h0 + state_idx * stride_init_state_token
         else:
